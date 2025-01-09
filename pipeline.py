@@ -5,6 +5,7 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 from jax.experimental.shard_map import shard_map
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.typing import ArrayLike
 
@@ -72,12 +73,18 @@ def gpipe_spmd_pipeline(
   num_stages: int,
   num_microbatches: int,
   circular_repeats: int = 1,
-  mesh: jax.sharding.Mesh = None,
+  mesh: jax.sharding.Mesh | None = None,
+  microbatch_sharding: P | None = None,
 ):
   """Transforms the stage_fn into a GPipe-style SPMD-pipelined forward function."""
   stage_init, stage_apply = hk.transform(stage_fn)
   auto_axes = {name for name in mesh.axis_names if name != _STAGE_AXIS}
   num_repeated_stages = num_stages * circular_repeats
+  m_sharding = (
+    NamedSharding(mesh, P(_STAGE_AXIS, *microbatch_sharding))
+    if microbatch_sharding
+    else None
+  )
 
   def _per_stage_params_sharding(input):
     param_shape = jax.eval_shape(stage_init, jax.random.key(0), input)
@@ -157,7 +164,7 @@ def gpipe_spmd_pipeline(
         cr_idx = jnp.minimum(
           (i - stage_index) // num_microbatches, circular_repeats - 1
         )
-        cr_params = jax.tree.map(lambda x: x[cr_idx], staged_params)
+        cr_params = jax.tree.map(lambda x, cr_idx=cr_idx: x[cr_idx], staged_params)
 
         # Input for this virtual stage (a repeat inside a stage).
         # Only stage 0 picks up from the first position of the microbatches as input
@@ -176,9 +183,7 @@ def gpipe_spmd_pipeline(
           # Write the output to the last spot and we rotate left NUM_MICROBATCHES time.
           output = output.at[num_mbs_per_stage - 1].set(
             jnp.where(
-              stage_index == num_stages - 1,
-              state[0],
-              output[num_mbs_per_stage - 1],
+              stage_index == num_stages - 1, state[0], output[num_mbs_per_stage - 1]
             )
           )
           if i < output_start_idx + num_microbatches - 1:
@@ -201,6 +206,8 @@ def gpipe_spmd_pipeline(
     staged_inputs = jax.tree.map(
       partial(_to_microbatches, num_microbatches=num_microbatches), inputs
     )
+    if m_sharding is not None:
+      staged_inputs = jax.lax.with_sharding_constraint(staged_inputs, m_sharding)
     # Reorder keys to follow the circular repeat semantics.
     #  For instance, (0, 1, 2, 3) ==> (0, 2, 1, 3), if we have 2 stages and 2 repeat.
     #    Device 0: 0     2
