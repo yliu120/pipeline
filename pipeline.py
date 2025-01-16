@@ -1,3 +1,4 @@
+from collections import namedtuple
 from functools import partial
 from typing import Callable
 
@@ -25,7 +26,7 @@ def _to_microbatches(input: ArrayLike, num_microbatches: int = 1):
   # This feature is called "stream_io".
   global_batch_size = input.shape[0]
   staged_batch = input.reshape(
-    num_microbatches, global_batch_size // num_microbatches, *input.shape[1:]
+      num_microbatches, global_batch_size // num_microbatches, *input.shape[1:]
   )
   return staged_batch
 
@@ -68,22 +69,39 @@ def _rotate_state_to_right(x: ArrayLike, num_stages: int = 1):
   return jnp.where(stage_index == 0, jnp.roll(x, -1, axis=0), x)
 
 
+# Args we carried to the next iteration of the layer scan of the pipeline_fn.
+PipelineCarry = namedtuple(
+    "PipelineCarry", [
+        # Microbatch inputs
+        "inputs",
+        # Microbatch inputs double buffering
+        "inputs2",
+        # Intermediate activations
+        "states",
+        # Outputs
+        "outputs",
+        # Loop index
+        "i"
+    ]
+)
+
+
 def gpipe_spmd_pipeline(
-  stage_fn: Callable,
-  num_stages: int,
-  num_microbatches: int,
-  circular_repeats: int = 1,
-  mesh: jax.sharding.Mesh | None = None,
-  microbatch_sharding: P | None = None,
+    stage_fn: Callable,
+    num_stages: int,
+    num_microbatches: int,
+    circular_repeats: int = 1,
+    mesh: jax.sharding.Mesh | None = None,
+    microbatch_sharding: P | None = None,
 ):
   """Transforms the stage_fn into a GPipe-style SPMD-pipelined forward function."""
   stage_init, stage_apply = hk.transform(stage_fn)
   auto_axes = {name for name in mesh.axis_names if name != _STAGE_AXIS}
   num_repeated_stages = num_stages * circular_repeats
   m_sharding = (
-    NamedSharding(mesh, P(_STAGE_AXIS, *microbatch_sharding))
-    if microbatch_sharding
-    else None
+      NamedSharding(mesh, P(_STAGE_AXIS, *microbatch_sharding))
+      if microbatch_sharding
+      else None
   )
 
   def _per_stage_params_sharding(input):
@@ -94,12 +112,12 @@ def gpipe_spmd_pipeline(
     p_sharding = _per_stage_params_sharding(staged_inputs[0])
 
     @partial(
-      shard_map,
-      mesh=mesh,
-      in_specs=(P(_STAGE_AXIS), P(_STAGE_AXIS)),
-      out_specs=p_sharding,
-      check_rep=False,
-      auto=frozenset(auto_axes),
+        shard_map,
+        mesh=mesh,
+        in_specs=(P(_STAGE_AXIS), P(_STAGE_AXIS)),
+        out_specs=p_sharding,
+        check_rep=False,
+        auto=frozenset(auto_axes),
     )
     def _init(keys, staged_inputs):
       return jax.vmap(stage_init, in_axes=(0, None))(keys[0], staged_inputs[0])
@@ -110,13 +128,13 @@ def gpipe_spmd_pipeline(
     p_sharding = _per_stage_params_sharding(staged_inputs[0])
 
     @partial(
-      shard_map,
-      mesh=mesh,
-      in_specs=(p_sharding, P(_STAGE_AXIS), P(_STAGE_AXIS)),
-      # Fixes me.
-      out_specs=P(_STAGE_AXIS),
-      check_rep=False,
-      auto=frozenset(auto_axes),
+        shard_map,
+        mesh=mesh,
+        in_specs=(p_sharding, P(_STAGE_AXIS), P(_STAGE_AXIS)),
+        # Fixes me.
+        out_specs=P(_STAGE_AXIS),
+        check_rep=False,
+        auto=frozenset(auto_axes),
     )
     def _apply(staged_params, keys, staged_inputs):
       """The function arranges pipelined computations in a single stage.
@@ -129,7 +147,8 @@ def gpipe_spmd_pipeline(
             (microbatch_per_stage, microbatch_size, ...)
       """
       stage_index = jax.lax.axis_index(_STAGE_AXIS)
-      # TODO(yunlongl): Supports non-divisible num microbatches by adding paddings.
+      # TODO(yunlongl): Supports non-divisible num microbatches by adding
+      # paddings.
       num_mbs_per_stage = num_microbatches // num_stages
       assert num_microbatches % num_stages == 0
 
@@ -138,87 +157,143 @@ def gpipe_spmd_pipeline(
 
       #  ==> Shape (microbatch_per_stage, microbatch_size, ...)
       #  For safety purpose, we pollute the garbage values with nans.
-      state = jnp.zeros_like(staged_inputs, dtype=staged_inputs.dtype) * jnp.nan
+      states = jnp.zeros_like(
+          staged_inputs,
+          dtype=staged_inputs.dtype) * jnp.nan
 
       # Prepare output
       # After SPMD partitioning, input should have a shape of
       #   (NUM_MICROBATCHES_PER_STAGE, MB_SIZE, NUM_FEATURES)
       output_shape_per_microbatch = jax.eval_shape(
-        stage_apply,
-        jax.tree.map(lambda x: x[0], staged_params),
-        keys[0],
-        staged_inputs[0],
+          stage_apply,
+          jax.tree.map(lambda x: x[0], staged_params),
+          keys[0],
+          staged_inputs[0],
       )
-      output = jnp.zeros(
-        (num_mbs_per_stage, *output_shape_per_microbatch.shape),
-        dtype=staged_inputs.dtype,
+      outputs = jnp.zeros(
+          (num_mbs_per_stage, *output_shape_per_microbatch.shape),
+          dtype=staged_inputs.dtype,
       )
       output_start_idx = (circular_repeats - 1) * num_microbatches + num_stages - 1
 
-      # TODO: Adds a stack layer version after we resolve the perf issue with DS.
       # We need run num_microbatches * CR in order to process all microbatches in
-      # stage 0 and we need an extra num_stages - 1 to push through all
+      # stage 0 and we need another num_stages - 1 to push through all
       # in-flight activations.
-      for i in range(num_microbatches * circular_repeats + num_stages - 1):
-        # Parameters for the current virtual stage.
+      num_iterations = num_microbatches * circular_repeats + num_stages - 1
+
+      def _compute_fn(c: PipelineCarry):
+        inputs, states, outputs, i = c.inputs, c.states, c.outputs, c.i
         cr_idx = jnp.minimum(
-          (i - stage_index) // num_microbatches, circular_repeats - 1
+            (i - stage_index) // num_microbatches, circular_repeats - 1
         )
-        cr_params = jax.tree.map(lambda x, cr_idx=cr_idx: x[cr_idx], staged_params)
+        cr_params = jax.tree.map(
+            lambda x, cr_idx=cr_idx: jax.lax.dynamic_slice_in_dim(x, cr_idx, 1)[0],
+            staged_params)
 
         # Input for this virtual stage (a repeat inside a stage).
         # Only stage 0 picks up from the first position of the microbatches as input
         # because we always rotate all the staged inputs after one virtual stage.
         # Other stages always pick up activations or garbage values.
-        first_stage_input = jnp.where(i < num_microbatches, staged_inputs[0], state[0])
-        state = state.at[0].set(
-          jnp.where(stage_index == 0, first_stage_input, state[0])
+        first_stage_input = jnp.where(i < num_microbatches, inputs[0], states[0])
+        states = states.at[0].set(
+            jnp.where(stage_index == 0, first_stage_input, states[0])
         )
 
         # Run stage function for this virtual stage.
-        state = state.at[0].set(stage_apply(cr_params, keys[cr_idx], state[0]))
+        states = states.at[0].set(stage_apply(cr_params, keys[cr_idx], states[0]))
 
-        # Write and rotate output before we rotate states.
-        if i >= output_start_idx:
-          # Write the output to the last spot and we rotate left NUM_MICROBATCHES time.
-          output = output.at[num_mbs_per_stage - 1].set(
+        # Rotate and write output before we rotate states.
+        outputs = _rotate_left(outputs, num_stages=num_stages)
+        outputs = outputs.at[num_mbs_per_stage - 1].set(
             jnp.where(
-              stage_index == num_stages - 1, state[0], output[num_mbs_per_stage - 1]
+                (stage_index == num_stages - 1) & (i >= output_start_idx),
+                states[0], outputs[num_mbs_per_stage - 1]
             )
-          )
-          if i < output_start_idx + num_microbatches - 1:
-            # No need to rotate for the last write.
-            output = _rotate_left(output, num_stages=num_stages)
+        )
+        # We ppermute the double buffer of the inputs while we use the original
+        # value for computations.
+        inputs2, i = c.inputs2, c.i
+        inputs2 = _rotate_left(inputs2, num_stages=num_stages)
 
-        # Rotate input
-        if i < num_microbatches * circular_repeats:
-          # After this amount of rotating, the stage 0 starts to enter
-          # the bubble zone.
-          staged_inputs = _rotate_left(staged_inputs, num_stages=num_stages)
-        # Rotate state
-        state = _rotate_state_to_right(state, num_stages=num_stages)
+        return inputs2, states, outputs
 
-      return output
+      def _epilogue_fn(states):
+        with jax.named_scope("ppermute_states"):
+          return _rotate_state_to_right(states, num_stages=num_stages)
+
+      # Pipeline collective permutes for states.
+      # The natural way to write the loop is the following:
+      #   for i in range(num_iterations):
+      #     inps, s, oups = _compute_fn(c)
+      #     s = _epilogue_fn(s)
+      #
+      # To overlap the state permutes with the compute, we can manually pipeline
+      # the above loop:
+      #   inps, s, oups = _compute_fn(c)     # Iteration K's compute
+      #   for i in range(1, num_iterations):
+      #     s = _epilogue_fn(s)              # Iteration K's epilogue
+      #     inps, s, oups = _compute_fn(c)   # Iteration K+1's compute
+      #   ...                                # The last epilogue
+      def _body_fn(c: PipelineCarry, _):
+        # Rotate state generated the last iteration.
+        states = _epilogue_fn(c.states)
+        # Parameters for the current virtual stage.
+        inputs2, states, outputs = _compute_fn(
+            PipelineCarry(
+                inputs=c.inputs2,
+                inputs2=c.inputs2,
+                states=states,
+                outputs=c.outputs,
+                i=c.i
+            )
+        )
+        return PipelineCarry(inputs=inputs2, inputs2=inputs2, states=states,
+                             outputs=outputs, i=c.i + 1), None
+
+      init_carry = PipelineCarry(
+          inputs=staged_inputs,
+          inputs2=staged_inputs.copy(),
+          states=states,
+          outputs=outputs,
+          i=0)
+
+      inputs2, states, outputs = _compute_fn(init_carry)
+      final_carry, _ = jax.lax.scan(
+          _body_fn,
+          PipelineCarry(
+              inputs=inputs2,
+              inputs2=inputs2,
+              states=states,
+              outputs=outputs,
+              i=1
+          ),
+          length=num_iterations-1,
+      )
+
+      return final_carry.outputs
 
     return _apply(staged_params, staged_keys, staged_inputs)
 
   def pipelined_fn(inputs):
     staged_inputs = jax.tree.map(
-      partial(_to_microbatches, num_microbatches=num_microbatches), inputs
+        partial(_to_microbatches, num_microbatches=num_microbatches), inputs
     )
     if m_sharding is not None:
-      staged_inputs = jax.lax.with_sharding_constraint(staged_inputs, m_sharding)
+      staged_inputs = jax.lax.with_sharding_constraint(
+          staged_inputs, m_sharding)
     # Reorder keys to follow the circular repeat semantics.
     #  For instance, (0, 1, 2, 3) ==> (0, 2, 1, 3), if we have 2 stages and 2 repeat.
     #    Device 0: 0     2
     #    Device 1:    1     3
     staged_keys = (
-      hk.next_rng_keys(num_repeated_stages).reshape(-1, num_stages).transpose()
+        hk.next_rng_keys(num_repeated_stages).reshape(-1,
+                                                      num_stages).transpose()
     )
     lifted_init = hk.transparent_lift(pipelined_init_fn)
     # The final shape of each leave of the pytree will be (NUM_STAGE * CIRCULAR_REPEAT, ...)
     # After we shard the params with P('stage'), each stage will receive a circular_repeats
-    # number of sets. In the above example, stage 0 will receive [params_0, params_2].
+    # number of sets. In the above example, stage 0 will receive [params_0,
+    # params_2].
     stage_params = lifted_init(staged_keys, staged_inputs)
     outputs = pipelined_apply_fn(stage_params, staged_keys, staged_inputs)
     return jax.tree.map(lambda x, ref: x.reshape(ref.shape), outputs, inputs)

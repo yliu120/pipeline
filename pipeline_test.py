@@ -1,3 +1,24 @@
+import os
+
+# TODO(yunlongl): Finds a way to avoid this formatting-breaking thing.
+XLA_FLAGS = [
+    "--xla_dump_to=/tmp/hlos",
+    "--xla_dump_hlo_pass_re=.*",
+    "--xla_gpu_enable_latency_hiding_scheduler=true",
+    "--xla_gpu_enable_triton_gemm=false",
+    "--xla_gpu_graph_level=0",
+    "--xla_disable_hlo_passes=rematerialization",
+    "--xla_gpu_use_memcpy_local_p2p=true",
+    "--xla_gpu_enable_pipelined_all_gather=true",
+    "--xla_gpu_enable_pipelined_reduce_scatter=true",
+    "--xla_gpu_enable_while_loop_double_buffering=true",
+    "--xla_gpu_multi_streamed_windowed_einsum=false",
+    "--xla_gpu_enable_pipelined_collectives=true",
+    "--xla_gpu_collective_permute_decomposer_threshold=0",
+    "--xla_gpu_enable_experimental_pipeline_parallelism_opt=true",
+]
+os.environ["XLA_FLAGS"] = " ".join(XLA_FLAGS)
+
 import unittest
 from functools import partial
 from typing import Any, Callable
@@ -15,7 +36,7 @@ from pipeline import gpipe_spmd_pipeline
 
 class Linear(hk.Module):
   def __init__(
-    self, output_size: int, mesh: Any | None = None, name: str | None = None
+      self, output_size: int, mesh: Any | None = None, name: str | None = None
   ):
     super().__init__(name=name)
     self.input_size = None
@@ -24,10 +45,10 @@ class Linear(hk.Module):
     self.b_init = jnp.zeros
 
   def with_sharding_constraints(
-    self,
-    weight_sharding: NamedSharding | None = None,
-    bias_sharding: NamedSharding | None = None,
-    activation_sharding: NamedSharding | None = None,
+      self,
+      weight_sharding: NamedSharding | None = None,
+      bias_sharding: NamedSharding | None = None,
+      activation_sharding: NamedSharding | None = None,
   ):
     self.w_sharding = weight_sharding
     self.b_sharding = bias_sharding
@@ -55,7 +76,8 @@ class Linear(hk.Module):
     return out
 
 
-def multi_stages(stage_fn: Callable, num_stages: int = 1, circular_repeats: int = 1):
+def multi_stages(stage_fn: Callable, num_stages: int = 1,
+                 circular_repeats: int = 1):
   """Simply stacks the stage_fn num_stages * circular_repeat times.
 
   This function transforms the `stage_fn` into a new function that repeats
@@ -74,7 +96,8 @@ def multi_stages(stage_fn: Callable, num_stages: int = 1, circular_repeats: int 
       return new_carry, None
 
     # In Haiku, we always want to apply JAX transformations to pure functions.
-    final_x, _ = jax.lax.scan(body_fn, input, params, length=num_repeated_stages)
+    final_x, _ = jax.lax.scan(
+        body_fn, input, params, length=num_repeated_stages)
     return final_x
 
   def multi_stages_fn(input):
@@ -92,7 +115,13 @@ class SpmdPipelineTest(unittest.TestCase):
       self.skipTest("Skip this tests on CPU.")
 
   def assert_params_allclose(self, actual, expected):
-    jax.tree.map(lambda x, y: np.testing.assert_allclose(x, y), actual, expected)
+    jax.tree.map(
+        lambda x,
+        y: np.testing.assert_allclose(
+            x,
+            y),
+        actual,
+        expected)
 
   def test_degenerated_case(self):
     global_batch_size = 16
@@ -101,17 +130,17 @@ class SpmdPipelineTest(unittest.TestCase):
     num_microbatches = 1
 
     mesh = jax.make_mesh(
-      (num_stages, jax.device_count() // num_stages), ("stage", "data")
+        (num_stages, jax.device_count() // num_stages), ("stage", "data")
     )
 
     def stage_fn(x):
       w_sharding = NamedSharding(mesh, P(None, "data"))
       b_sharding = NamedSharding(mesh, P("data"))
       x = Linear(hidden_dim, mesh=mesh, name="first").with_sharding_constraints(
-        w_sharding, b_sharding
+          w_sharding, b_sharding
       )(x)
       x = Linear(hidden_dim, mesh=mesh, name="second").with_sharding_constraints(
-        w_sharding, b_sharding
+          w_sharding, b_sharding
       )(x)
       return x
 
@@ -119,13 +148,13 @@ class SpmdPipelineTest(unittest.TestCase):
     inp = jax.random.normal(key, (global_batch_size, hidden_dim))
 
     pipelined_fn = hk.transform(
-      gpipe_spmd_pipeline(
-        stage_fn,
-        num_stages,
-        num_microbatches,
-        mesh=mesh,
-        microbatch_sharding=P("data"),
-      )
+        gpipe_spmd_pipeline(
+            stage_fn,
+            num_stages,
+            num_microbatches,
+            mesh=mesh,
+            microbatch_sharding=P("data"),
+        )
     )
     pipelined_params = jax.jit(pipelined_fn.init)(key, inp)
     pipelined_re = jax.jit(pipelined_fn.apply)(pipelined_params, key, inp)
@@ -135,7 +164,9 @@ class SpmdPipelineTest(unittest.TestCase):
     # controlling the random number generators the initializers use.
     one_stage_fn = hk.transform(multi_stages(stage_fn, num_stages=num_stages))
     non_pipelined_params = jax.jit(one_stage_fn.init)(key, inp)
-    non_pipelined_re = jax.jit(one_stage_fn.apply)(non_pipelined_params, key, inp)
+    non_pipelined_re = jax.jit(
+        one_stage_fn.apply)(
+        non_pipelined_params, key, inp)
 
     self.assert_params_allclose(pipelined_params, non_pipelined_params)
     np.testing.assert_allclose(pipelined_re, non_pipelined_re)
@@ -147,7 +178,7 @@ class SpmdPipelineTest(unittest.TestCase):
     num_microbatches = 8
 
     mesh = jax.make_mesh(
-      (num_stages, jax.device_count() // num_stages), ("stage", "data")
+        (num_stages, jax.device_count() // num_stages), ("stage", "data")
     )
 
     def stage_fn(x):
@@ -155,21 +186,21 @@ class SpmdPipelineTest(unittest.TestCase):
       b_sharding = NamedSharding(mesh, P("data"))
       a_sharding = NamedSharding(mesh, P("data", None))
       x = Linear(hidden_dim, mesh=mesh, name="first").with_sharding_constraints(
-        w_sharding, b_sharding, a_sharding
+          w_sharding, b_sharding, a_sharding
       )(x)
       x = Linear(hidden_dim, mesh=mesh, name="second").with_sharding_constraints(
-        w_sharding, b_sharding, a_sharding
+          w_sharding, b_sharding, a_sharding
       )(x)
       return x
 
     pipelined_fn = hk.transform(
-      gpipe_spmd_pipeline(
-        stage_fn,
-        num_stages,
-        num_microbatches,
-        mesh=mesh,
-        microbatch_sharding=P("data"),
-      )
+        gpipe_spmd_pipeline(
+            stage_fn,
+            num_stages,
+            num_microbatches,
+            mesh=mesh,
+            microbatch_sharding=P("data"),
+        )
     )
 
     key = jax.random.key(0)
@@ -181,7 +212,9 @@ class SpmdPipelineTest(unittest.TestCase):
     # Reference
     four_stages_fn = hk.transform(multi_stages(stage_fn, num_stages=num_stages))
     non_pipelined_params = jax.jit(four_stages_fn.init)(key, inp)
-    non_pipelined_re = jax.jit(four_stages_fn.apply)(non_pipelined_params, key, inp)
+    non_pipelined_re = jax.jit(
+        four_stages_fn.apply)(
+        non_pipelined_params, key, inp)
 
     self.assert_params_allclose(pipelined_params, non_pipelined_params)
     # TODO: Debug the small numerical differences
@@ -195,7 +228,7 @@ class SpmdPipelineTest(unittest.TestCase):
     circular_repeats = 2
 
     mesh = jax.make_mesh(
-      (num_stages, jax.device_count() // num_stages), ("stage", "data")
+        (num_stages, jax.device_count() // num_stages), ("stage", "data")
     )
 
     def stage_fn(x):
@@ -203,18 +236,18 @@ class SpmdPipelineTest(unittest.TestCase):
       b_sharding = NamedSharding(mesh, P("data"))
       a_sharding = NamedSharding(mesh, P("data", None))
       return Linear(hidden_dim, mesh=mesh, name="first").with_sharding_constraints(
-        w_sharding, b_sharding, a_sharding
+          w_sharding, b_sharding, a_sharding
       )(x)
 
     pipelined_fn = hk.transform(
-      gpipe_spmd_pipeline(
-        stage_fn,
-        num_stages,
-        num_microbatches,
-        circular_repeats=circular_repeats,
-        mesh=mesh,
-        microbatch_sharding=P("data"),
-      )
+        gpipe_spmd_pipeline(
+            stage_fn,
+            num_stages,
+            num_microbatches,
+            circular_repeats=circular_repeats,
+            mesh=mesh,
+            microbatch_sharding=P("data"),
+        )
     )
 
     key = jax.random.key(0)
@@ -227,21 +260,26 @@ class SpmdPipelineTest(unittest.TestCase):
 
     # Reference
     eight_stages_fn = hk.transform(
-      multi_stages(stage_fn, num_stages=num_stages, circular_repeats=circular_repeats)
+        multi_stages(
+            stage_fn,
+            num_stages=num_stages,
+            circular_repeats=circular_repeats)
     )
     non_pipelined_params = jax.jit(eight_stages_fn.init)(key, inp)
-    non_pipelined_re = jax.jit(eight_stages_fn.apply)(non_pipelined_params, key, inp)
+    non_pipelined_re = jax.jit(
+        eight_stages_fn.apply)(
+        non_pipelined_params, key, inp)
 
     # [0, 4, 1, 5, 2, 6, 3, 7] -> [0, 1, 2, 3, 4, 5, 6, 7]
     original_order = (
-      np.arange(num_stages * circular_repeats)
-      .reshape(num_stages, circular_repeats)
-      .transpose()
-      .reshape(-1)
+        np.arange(num_stages * circular_repeats)
+        .reshape(num_stages, circular_repeats)
+        .transpose()
+        .reshape(-1)
     )
     self.assert_params_allclose(
-      jax.tree.map(lambda x: x[original_order], pipelined_params),
-      non_pipelined_params,
+        jax.tree.map(lambda x: x[original_order], pipelined_params),
+        non_pipelined_params,
     )
     # TODO: Debug the small numerical differences
     np.testing.assert_allclose(pipelined_re, non_pipelined_re, atol=2e-3)
@@ -254,7 +292,7 @@ class SpmdPipelineTest(unittest.TestCase):
     circular_repeats = 2
 
     mesh = jax.make_mesh(
-      (num_stages, jax.device_count() // num_stages), ("stage", "data")
+        (num_stages, jax.device_count() // num_stages), ("stage", "data")
     )
 
     def stage_fn(x):
@@ -262,15 +300,15 @@ class SpmdPipelineTest(unittest.TestCase):
       b_sharding = NamedSharding(mesh, P("data"))
       a_sharding = NamedSharding(mesh, P("data", None))
       x = Linear(hidden_dim, mesh=mesh, name="first").with_sharding_constraints(
-        w_sharding, b_sharding, a_sharding
+          w_sharding, b_sharding, a_sharding
       )(x)
 
       @partial(
-        shard_map,
-        mesh=mesh,
-        in_specs=P("data", None),
-        out_specs=P("data", None),
-        check_rep=False,
+          shard_map,
+          mesh=mesh,
+          in_specs=P("data", None),
+          out_specs=P("data", None),
+          check_rep=False,
       )
       def f(x):
         return jax.nn.softmax(x)
@@ -278,14 +316,14 @@ class SpmdPipelineTest(unittest.TestCase):
       return f(x)
 
     pipelined_fn = hk.transform(
-      gpipe_spmd_pipeline(
-        stage_fn,
-        num_stages,
-        num_microbatches,
-        circular_repeats=circular_repeats,
-        mesh=mesh,
-        microbatch_sharding=P("data"),
-      )
+        gpipe_spmd_pipeline(
+            stage_fn,
+            num_stages,
+            num_microbatches,
+            circular_repeats=circular_repeats,
+            mesh=mesh,
+            microbatch_sharding=P("data"),
+        )
     )
 
     key = jax.random.key(0)
@@ -298,24 +336,99 @@ class SpmdPipelineTest(unittest.TestCase):
 
     # Reference
     eight_stages_fn = hk.transform(
-      multi_stages(stage_fn, num_stages=num_stages, circular_repeats=circular_repeats)
+        multi_stages(
+            stage_fn,
+            num_stages=num_stages,
+            circular_repeats=circular_repeats)
     )
     non_pipelined_params = jax.jit(eight_stages_fn.init)(key, inp)
-    non_pipelined_re = jax.jit(eight_stages_fn.apply)(non_pipelined_params, key, inp)
+    non_pipelined_re = jax.jit(
+        eight_stages_fn.apply)(
+        non_pipelined_params, key, inp)
 
     # [0, 4, 1, 5, 2, 6, 3, 7] -> [0, 1, 2, 3, 4, 5, 6, 7]
     original_order = (
-      np.arange(num_stages * circular_repeats)
-      .reshape(num_stages, circular_repeats)
-      .transpose()
-      .reshape(-1)
+        np.arange(num_stages * circular_repeats)
+        .reshape(num_stages, circular_repeats)
+        .transpose()
+        .reshape(-1)
     )
     self.assert_params_allclose(
-      jax.tree.map(lambda x: x[original_order], pipelined_params),
-      non_pipelined_params,
+        jax.tree.map(lambda x: x[original_order], pipelined_params),
+        non_pipelined_params,
     )
     # TODO: Debug the small numerical differences
     np.testing.assert_allclose(pipelined_re, non_pipelined_re, atol=2e-3)
+
+  def test_pipeline_performance(self):
+    global_batch_size = 32
+    hidden_dim = 8192
+    num_stages = 4
+    num_microbatches = 8
+    circular_repeats = 4
+
+    mesh = jax.make_mesh(
+        (num_stages, jax.device_count() // num_stages), ("stage", "data")
+    )
+
+    def stage_fn(x):
+      w_sharding = NamedSharding(mesh, P(None, "data"))
+      b_sharding = NamedSharding(mesh, P("data"))
+      a_sharding = NamedSharding(mesh, P("data", None))
+      return Linear(hidden_dim, mesh=mesh, name="first").with_sharding_constraints(
+          w_sharding, b_sharding, a_sharding
+      )(x)
+
+    pipelined_fn = hk.transform(
+        gpipe_spmd_pipeline(
+            stage_fn,
+            num_stages,
+            num_microbatches,
+            circular_repeats=circular_repeats,
+            mesh=mesh,
+            microbatch_sharding=P("data"),
+        )
+    )
+
+    key = jax.random.key(0)
+    inp = jax.random.normal(key, (global_batch_size, hidden_dim))
+
+    # The parameters will be organized as [0, 4, 1, 5, 2, 6, 3, 7] as the layers are
+    # distributed to the stages in a circular manner.
+    pipelined_params = jax.jit(pipelined_fn.init)(key, inp)
+    pipelined_apply_fn_aot = jax.jit(
+        pipelined_fn.apply).lower(
+        pipelined_params, key, inp).compile()
+
+    # Reference
+    eight_stages_fn = hk.transform(
+        multi_stages(
+            stage_fn,
+            num_stages=num_stages,
+            circular_repeats=circular_repeats)
+    )
+    non_pipelined_params = jax.jit(eight_stages_fn.init)(key, inp)
+    non_piplined_apply_fn_aot = jax.jit(
+        eight_stages_fn.apply).lower(
+        non_pipelined_params, key, inp).compile()
+
+    # Warmup NCCL
+    pipelined_re = pipelined_apply_fn_aot(pipelined_params, key, inp)
+    non_pipelined_re = non_piplined_apply_fn_aot(non_pipelined_params, key, inp)
+    jax.block_until_ready((pipelined_re, non_pipelined_re))
+
+    # Profile
+    with jax.profiler.trace("/tmp/tensorboard"):
+      results = []
+      for _ in range(10):
+        results.append(pipelined_apply_fn_aot(pipelined_params, key, inp))
+      jax.block_until_ready(results)
+
+      results.clear()
+      for _ in range(10):
+        results.append(
+            non_piplined_apply_fn_aot(non_pipelined_params, key, inp))
+      jax.block_until_ready(results)
 
 
 if __name__ == "__main__":
