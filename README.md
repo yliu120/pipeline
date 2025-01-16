@@ -1,1 +1,1 @@
-# Pipeline Parallelism with JAX
+# Pipeline Parallelism with JAX Shard Map.
