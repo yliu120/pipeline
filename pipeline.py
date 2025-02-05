@@ -63,9 +63,12 @@ def _rotate_state_to_right(x: ArrayLike, num_stages: int = 1):
   """
   if num_stages == 1:
     return x
-  right = [(i, (i + 1) % num_stages) for i in range(num_stages)]
-  x = jax.lax.ppermute(x, _STAGE_AXIS, right)
+  right = [(i, (i + 1) % num_stages) for i in range(num_stages - 1)]
+  # Breaks down this ppermute with cycles to utilize XLA CP decomposer.
+  x1 = jax.lax.ppermute(x, _STAGE_AXIS, right)
+  x2 = jax.lax.ppermute(x, _STAGE_AXIS, [(num_stages - 1, 0)])
   stage_index = jax.lax.axis_index(_STAGE_AXIS)
+  x = jnp.where(stage_index == 0, x2, x1)
   return jnp.where(stage_index == 0, jnp.roll(x, -1, axis=0), x)
 
 

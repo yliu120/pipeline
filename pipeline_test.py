@@ -7,15 +7,14 @@ XLA_FLAGS = [
     "--xla_gpu_enable_latency_hiding_scheduler=true",
     "--xla_gpu_enable_triton_gemm=false",
     "--xla_gpu_graph_level=0",
-    "--xla_disable_hlo_passes=rematerialization",
-    "--xla_gpu_use_memcpy_local_p2p=true",
+    "--xla_disable_hlo_passes=rematerialization,collective-permute-cycle-decomposer",
+    # "--xla_gpu_use_memcpy_local_p2p=true",
     "--xla_gpu_enable_pipelined_all_gather=true",
     "--xla_gpu_enable_pipelined_reduce_scatter=true",
     "--xla_gpu_enable_while_loop_double_buffering=true",
     "--xla_gpu_multi_streamed_windowed_einsum=false",
-    "--xla_gpu_enable_pipelined_collectives=true",
     "--xla_gpu_collective_permute_decomposer_threshold=0",
-    "--xla_gpu_enable_experimental_pipeline_parallelism_opt=true",
+    "--xla_gpu_experimental_pipeline_parallelism_opt_level=PIPELINE_PARALLELISM_OPT_LEVEL_ENABLE",
 ]
 os.environ["XLA_FLAGS"] = " ".join(XLA_FLAGS)
 
@@ -113,6 +112,7 @@ class SpmdPipelineTest(unittest.TestCase):
   def setUp(self):
     if "cpu" in jax.devices()[0].device_kind:
       self.skipTest("Skip this tests on CPU.")
+    jax.config.update("jax_use_shardy_partitioner", True)
 
   def assert_params_allclose(self, actual, expected):
     jax.tree.map(
