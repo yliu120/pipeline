@@ -65,10 +65,15 @@ def _rotate_state_to_right(x: ArrayLike, num_stages: int = 1):
     return x
   right = [(i, (i + 1) % num_stages) for i in range(num_stages - 1)]
   # Breaks down this ppermute with cycles to utilize XLA CP decomposer.
-  x1 = jax.lax.ppermute(x, _STAGE_AXIS, right)
-  x2 = jax.lax.ppermute(x, _STAGE_AXIS, [(num_stages - 1, 0)])
+  # x1 = jax.lax.ppermute(x, _STAGE_AXIS, right)
+  # x2 = jax.lax.ppermute(x, _STAGE_AXIS, [(num_stages - 1, 0)])
+  x1 = jax.lax.psend(x, None, _STAGE_AXIS, perm=right)
+  y1 = jax.lax.precv(x1, _STAGE_AXIS, perm=right)
+  x2 = jax.lax.psend(x, y1, _STAGE_AXIS, perm=[(num_stages - 1, 0)])
+  y2 = jax.lax.precv(x2, _STAGE_AXIS, perm=[(num_stages - 1, 0)])
   stage_index = jax.lax.axis_index(_STAGE_AXIS)
-  x = jnp.where(stage_index == 0, x2, x1)
+  # x = jnp.where(stage_index == 0, x2, x1)
+  x = jnp.where(stage_index == 0, y2, y1)
   return jnp.where(stage_index == 0, jnp.roll(x, -1, axis=0), x)
 
 
@@ -238,37 +243,28 @@ def gpipe_spmd_pipeline(
       #     inps, s, oups = _compute_fn(c)   # Iteration K+1's compute
       #   ...                                # The last epilogue
       def _body_fn(c: PipelineCarry, _):
-        # Rotate state generated the last iteration.
-        states = _epilogue_fn(c.states)
         # Parameters for the current virtual stage.
         inputs2, states, outputs = _compute_fn(
             PipelineCarry(
                 inputs=c.inputs2,
                 inputs2=c.inputs2,
-                states=states,
+                states=c.states,
                 outputs=c.outputs,
                 i=c.i
             )
         )
+        states = _epilogue_fn(states)
         return PipelineCarry(inputs=inputs2, inputs2=inputs2, states=states,
                              outputs=outputs, i=c.i + 1), None
 
-      init_carry = PipelineCarry(
-          inputs=staged_inputs,
-          inputs2=staged_inputs.copy(),
-          states=states,
-          outputs=outputs,
-          i=0)
-
-      inputs2, states, outputs = _compute_fn(init_carry)
       final_carry, _ = jax.lax.scan(
           _body_fn,
           PipelineCarry(
-              inputs=inputs2,
-              inputs2=inputs2,
+              inputs=staged_inputs,
+              inputs2=staged_inputs.copy(),
               states=states,
               outputs=outputs,
-              i=1
+              i=0,
           ),
           length=num_iterations-1,
       )
