@@ -51,7 +51,7 @@ def _rotate_left(x: ArrayLike, num_stages: int = 1):
   return jnp.roll(x, -1, axis=0)
 
 
-def _rotate_state_to_right(x: ArrayLike, num_stages: int = 1):
+def _rotate_state_to_right(x: ArrayLike, num_stages: int = 1, deps=None):
   """Rotates the state buffer along its second axis to the right.
 
   This version only works inside a shard_map call. For instance,
@@ -63,17 +63,20 @@ def _rotate_state_to_right(x: ArrayLike, num_stages: int = 1):
   """
   if num_stages == 1:
     return x
-  right = [(i, (i + 1) % num_stages) for i in range(num_stages - 1)]
+  # left = [(i, (i + 1) % num_stages) for i in range(0, num_stages, 2)]
+  # right = [(i, (i + 1) % num_stages) for i in range(1, num_stages, 2)]
+  
   # Breaks down this ppermute with cycles to utilize XLA CP decomposer.
   # x1 = jax.lax.ppermute(x, _STAGE_AXIS, right)
   # x2 = jax.lax.ppermute(x, _STAGE_AXIS, [(num_stages - 1, 0)])
-  x1 = jax.lax.psend(x, None, _STAGE_AXIS, perm=right)
-  y1 = jax.lax.precv(x1, _STAGE_AXIS, perm=right)
-  x2 = jax.lax.psend(x, y1, _STAGE_AXIS, perm=[(num_stages - 1, 0)])
-  y2 = jax.lax.precv(x2, _STAGE_AXIS, perm=[(num_stages - 1, 0)])
+  # x1 = jax.lax.psend(x, deps, _STAGE_AXIS, perm=right)
+  # y1 = jax.lax.precv(x1, x1, _STAGE_AXIS, perm=right)
+  # x2 = jax.lax.psend(x, y1, _STAGE_AXIS, perm=left)
+  # y2 = jax.lax.precv(x2, x2, _STAGE_AXIS, perm=left)
   stage_index = jax.lax.axis_index(_STAGE_AXIS)
   # x = jnp.where(stage_index == 0, x2, x1)
-  x = jnp.where(stage_index == 0, y2, y1)
+  # x = jnp.where(stage_index == 0, y2, y1)
+  x = jax.lax.ppermute(x, _STAGE_AXIS, [(i, (i + 1) % num_stages) for i in range(num_stages)])
   return jnp.where(stage_index == 0, jnp.roll(x, -1, axis=0), x)
 
 
@@ -225,10 +228,6 @@ def gpipe_spmd_pipeline(
 
         return inputs2, states, outputs
 
-      def _epilogue_fn(states):
-        with jax.named_scope("ppermute_states"):
-          return _rotate_state_to_right(states, num_stages=num_stages)
-
       # Pipeline collective permutes for states.
       # The natural way to write the loop is the following:
       #   for i in range(num_iterations):
@@ -253,7 +252,9 @@ def gpipe_spmd_pipeline(
                 i=c.i
             )
         )
-        states = _epilogue_fn(states)
+        with jax.named_scope("ppermute_states"):
+          outputs_dep = jax.lax.after_all_general_p.bind(outputs)
+          states = _rotate_state_to_right(states, num_stages=num_stages, deps=outputs_dep)
         return PipelineCarry(inputs=inputs2, inputs2=inputs2, states=states,
                              outputs=outputs, i=c.i + 1), None
 
