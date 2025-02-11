@@ -8,13 +8,14 @@ XLA_FLAGS = [
     "--xla_gpu_enable_triton_gemm=false",
     "--xla_gpu_graph_level=0",
     "--xla_disable_hlo_passes=rematerialization,collective-permute-cycle-decomposer",
-    # "--xla_gpu_use_memcpy_local_p2p=true",
+    "--xla_gpu_use_memcpy_local_p2p=false",
     "--xla_gpu_enable_pipelined_all_gather=true",
     "--xla_gpu_enable_pipelined_reduce_scatter=true",
     "--xla_gpu_enable_while_loop_double_buffering=true",
     "--xla_gpu_multi_streamed_windowed_einsum=false",
-    # "--xla_gpu_collective_permute_decomposer_threshold=0",
-    # "--xla_gpu_experimental_pipeline_parallelism_opt_level=PIPELINE_PARALLELISM_OPT_LEVEL_ENABLE",
+    "--xla_gpu_collective_permute_decomposer_threshold=0",
+    "--xla_gpu_experimental_enable_pipeline_parallelism_opt=true",
+    # "--xla_gpu_enable_pipelined_p2p=true",
 ]
 os.environ["XLA_FLAGS"] = " ".join(XLA_FLAGS)
 
@@ -426,15 +427,15 @@ class SpmdPipelineTest(unittest.TestCase):
     # Profile
     with jax.profiler.trace("/tmp/tensorboard"):
       results = []
-      for _ in range(10):
-        results.append(pipelined_apply_fn_aot(pipelined_params, key, inp))
-      jax.block_until_ready(results)
+      # for _ in range(10):
+      #   results.append(pipelined_apply_fn_aot(pipelined_params, key, inp))
+      # jax.block_until_ready(results)
 
       results.clear()
+      input2 = inp
       for _ in range(10):
-        results.append(
-            non_piplined_apply_fn_aot(non_pipelined_params, key, inp))
-      jax.block_until_ready(results)
+        input2 = non_piplined_apply_fn_aot(non_pipelined_params, key, input2)
+      jax.block_until_ready(input2)
 
 
 if __name__ == "__main__":

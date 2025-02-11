@@ -63,12 +63,15 @@ def _rotate_state_to_right(x: ArrayLike, num_stages: int = 1, deps=None):
   """
   if num_stages == 1:
     return x
+  full_perm = [(i, (i + 1) % num_stages) for i in range(num_stages)]
+  left = full_perm[:-1]
+  right = [full_perm[-1]]
   # left = [(i, (i + 1) % num_stages) for i in range(0, num_stages, 2)]
   # right = [(i, (i + 1) % num_stages) for i in range(1, num_stages, 2)]
   
   # Breaks down this ppermute with cycles to utilize XLA CP decomposer.
-  # x1 = jax.lax.ppermute(x, _STAGE_AXIS, right)
-  # x2 = jax.lax.ppermute(x, _STAGE_AXIS, [(num_stages - 1, 0)])
+  x1 = jax.lax.ppermute(x, _STAGE_AXIS, right)
+  x2 = jax.lax.ppermute(x, _STAGE_AXIS, left)
   # x1 = jax.lax.psend(x, deps, _STAGE_AXIS, perm=right)
   # y1 = jax.lax.precv(x1, x1, _STAGE_AXIS, perm=right)
   # x2 = jax.lax.psend(x, y1, _STAGE_AXIS, perm=left)
@@ -76,7 +79,8 @@ def _rotate_state_to_right(x: ArrayLike, num_stages: int = 1, deps=None):
   stage_index = jax.lax.axis_index(_STAGE_AXIS)
   # x = jnp.where(stage_index == 0, x2, x1)
   # x = jnp.where(stage_index == 0, y2, y1)
-  x = jax.lax.ppermute(x, _STAGE_AXIS, [(i, (i + 1) % num_stages) for i in range(num_stages)])
+  x = x1 + x2
+  # x = jax.lax.ppermute(x, _STAGE_AXIS, [(i, (i + 1) % num_stages) for i in range(num_stages)])
   return jnp.where(stage_index == 0, jnp.roll(x, -1, axis=0), x)
 
 
@@ -214,7 +218,7 @@ def gpipe_spmd_pipeline(
         states = states.at[0].set(stage_apply(cr_params, keys[cr_idx], states[0]))
 
         # Rotate and write output before we rotate states.
-        outputs = _rotate_left(outputs, num_stages=num_stages)
+        # outputs = _rotate_left(outputs, num_stages=num_stages)
         outputs = outputs.at[num_mbs_per_stage - 1].set(
             jnp.where(
                 (stage_index == num_stages - 1) & (i >= output_start_idx),
@@ -224,7 +228,7 @@ def gpipe_spmd_pipeline(
         # We ppermute the double buffer of the inputs while we use the original
         # value for computations.
         inputs2, i = c.inputs2, c.i
-        inputs2 = _rotate_left(inputs2, num_stages=num_stages)
+        # inputs2 = _rotate_left(inputs2, num_stages=num_stages)
 
         return inputs2, states, outputs
 
