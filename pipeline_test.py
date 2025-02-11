@@ -8,18 +8,21 @@ XLA_FLAGS = [
     "--xla_gpu_enable_triton_gemm=false",
     "--xla_gpu_graph_level=0",
     "--xla_disable_hlo_passes=rematerialization",
-    "--xla_gpu_use_memcpy_local_p2p=true",
+    # This flag has been very flaky.
+    # "--xla_gpu_use_memcpy_local_p2p=true",
     "--xla_gpu_enable_pipelined_all_gather=true",
     "--xla_gpu_enable_pipelined_reduce_scatter=true",
     "--xla_gpu_enable_while_loop_double_buffering=true",
     "--xla_gpu_multi_streamed_windowed_einsum=false",
-    "--xla_gpu_enable_pipelined_collectives=true",
-    "--xla_gpu_collective_permute_decomposer_threshold=0",
-    "--xla_gpu_enable_experimental_pipeline_parallelism_opt=true",
+    # Enable them once we use CP decomposer.
+    # "--xla_gpu_collective_permute_decomposer_threshold=0",
+    # "--xla_gpu_enable_experimental_pipeline_parallelism_opt=true",
 ]
+
 os.environ["XLA_FLAGS"] = " ".join(XLA_FLAGS)
 
 import unittest
+from collections import namedtuple
 from functools import partial
 from typing import Any, Callable
 
@@ -35,6 +38,13 @@ from pipeline import gpipe_spmd_pipeline
 
 
 class Linear(hk.Module):
+
+  # Specifies shardings for the linear layer.
+  ShardingConfig = namedtuple(
+    "ShardingConfig", ['w', 'b', 'a'],
+    defaults=[None, None, None]
+  )
+
   def __init__(
       self, output_size: int, mesh: Any | None = None, name: str | None = None
   ):
@@ -43,16 +53,10 @@ class Linear(hk.Module):
     self.output_size = output_size
     self.mesh = mesh
     self.b_init = jnp.zeros
+    self.shardings = self.ShardingConfig()
 
-  def with_sharding_constraints(
-      self,
-      weight_sharding: NamedSharding | None = None,
-      bias_sharding: NamedSharding | None = None,
-      activation_sharding: NamedSharding | None = None,
-  ):
-    self.w_sharding = weight_sharding
-    self.b_sharding = bias_sharding
-    self.a_sharding = activation_sharding
+  def with_sharding_constraints(self, shardings: ShardingConfig):
+    self.shardings = shardings
     return self
 
   def __call__(self, inputs: jax.Array):
@@ -63,16 +67,16 @@ class Linear(hk.Module):
     stddev = 1.0 / np.sqrt(self.input_size)
     w_init = hk.initializers.TruncatedNormal(stddev=stddev)
     w = hk.get_parameter("w", [input_size, output_size], dtype, init=w_init)
-    if self.w_sharding is not None:
-      w = jax.lax.with_sharding_constraint(w, self.w_sharding)
+    if self.shardings.w is not None:
+      w = jax.lax.with_sharding_constraint(w, self.shardings.w)
     out = jnp.dot(inputs, w)
     b = hk.get_parameter("b", [self.output_size], dtype, init=self.b_init)
-    if self.b_sharding is not None:
-      b = jax.lax.with_sharding_constraint(b, self.b_sharding)
+    if self.shardings.b is not None:
+      b = jax.lax.with_sharding_constraint(b, self.shardings.b)
     b = jnp.broadcast_to(b, out.shape)
     out = out + b
-    if self.a_sharding is not None:
-      out = jax.lax.with_sharding_constraint(out, self.b_sharding)
+    if self.shardings.a is not None:
+      out = jax.lax.with_sharding_constraint(out, self.shardings.a)
     return out
 
 
@@ -87,12 +91,12 @@ def multi_stages(stage_fn: Callable, num_stages: int = 1,
   num_repeated_stages = num_stages * circular_repeats
   stage_init, stage_apply = hk.transform(stage_fn)
 
-  def _init_fn(keys, input):
-    return jax.vmap(stage_init, in_axes=(0, None))(keys, input)
+  def _init_fn(keys, input, **kwargs):
+    return jax.vmap(stage_init, in_axes=(0, None))(keys, input, **kwargs)
 
-  def _apply_fn(params, input):
+  def _apply_fn(params, input, **kwargs):
     def body_fn(carry, params_per_stage):
-      new_carry = stage_apply(params_per_stage, None, carry)
+      new_carry = stage_apply(params_per_stage, None, carry, **kwargs)
       return new_carry, None
 
     # In Haiku, we always want to apply JAX transformations to pure functions.
@@ -100,11 +104,11 @@ def multi_stages(stage_fn: Callable, num_stages: int = 1,
         body_fn, input, params, length=num_repeated_stages)
     return final_x
 
-  def multi_stages_fn(input):
+  def multi_stages_fn(input, **kwargs):
     keys = hk.next_rng_keys(num_repeated_stages)
     lifted_init_fn = hk.transparent_lift(_init_fn)
-    params = lifted_init_fn(keys, input)
-    return _apply_fn(params, input)
+    params = lifted_init_fn(keys, input, **kwargs)
+    return _apply_fn(params, input, **kwargs)
 
   return multi_stages_fn
 
@@ -133,15 +137,18 @@ class SpmdPipelineTest(unittest.TestCase):
         (num_stages, jax.device_count() // num_stages), ("stage", "data")
     )
 
+    shardings = Linear.ShardingConfig(
+      w=NamedSharding(mesh, P(None, "data")),
+      b=NamedSharding(mesh, P("data")),
+    )
+
     def stage_fn(x):
-      w_sharding = NamedSharding(mesh, P(None, "data"))
-      b_sharding = NamedSharding(mesh, P("data"))
-      x = Linear(hidden_dim, mesh=mesh, name="first").with_sharding_constraints(
-          w_sharding, b_sharding
-      )(x)
-      x = Linear(hidden_dim, mesh=mesh, name="second").with_sharding_constraints(
-          w_sharding, b_sharding
-      )(x)
+      x = Linear(
+        hidden_dim, mesh=mesh, name="first"
+      ).with_sharding_constraints(shardings)(x)
+      x = Linear(
+        hidden_dim, mesh=mesh, name="second"
+      ).with_sharding_constraints(shardings)(x)
       return x
 
     key = jax.random.key(0)
@@ -181,16 +188,18 @@ class SpmdPipelineTest(unittest.TestCase):
         (num_stages, jax.device_count() // num_stages), ("stage", "data")
     )
 
+    shardings = Linear.ShardingConfig(
+      w=NamedSharding(mesh, P(None, "data")),
+      b=NamedSharding(mesh, P("data")),
+      a=NamedSharding(mesh, P("data", None))
+    )
     def stage_fn(x):
-      w_sharding = NamedSharding(mesh, P(None, "data"))
-      b_sharding = NamedSharding(mesh, P("data"))
-      a_sharding = NamedSharding(mesh, P("data", None))
-      x = Linear(hidden_dim, mesh=mesh, name="first").with_sharding_constraints(
-          w_sharding, b_sharding, a_sharding
-      )(x)
-      x = Linear(hidden_dim, mesh=mesh, name="second").with_sharding_constraints(
-          w_sharding, b_sharding, a_sharding
-      )(x)
+      x = Linear(
+        hidden_dim, mesh=mesh, name="first"
+      ).with_sharding_constraints(shardings)(x)
+      x = Linear(
+        hidden_dim, mesh=mesh, name="second"
+      ).with_sharding_constraints(shardings)(x)
       return x
 
     pipelined_fn = hk.transform(
@@ -231,13 +240,15 @@ class SpmdPipelineTest(unittest.TestCase):
         (num_stages, jax.device_count() // num_stages), ("stage", "data")
     )
 
+    shardings = Linear.ShardingConfig(
+      w=NamedSharding(mesh, P(None, "data")),
+      b=NamedSharding(mesh, P("data")),
+      a=NamedSharding(mesh, P("data", None))
+    )
     def stage_fn(x):
-      w_sharding = NamedSharding(mesh, P(None, "data"))
-      b_sharding = NamedSharding(mesh, P("data"))
-      a_sharding = NamedSharding(mesh, P("data", None))
-      return Linear(hidden_dim, mesh=mesh, name="first").with_sharding_constraints(
-          w_sharding, b_sharding, a_sharding
-      )(x)
+      return Linear(
+        hidden_dim, mesh=mesh, name="first"
+      ).with_sharding_constraints(shardings)(x)
 
     pipelined_fn = hk.transform(
         gpipe_spmd_pipeline(
@@ -295,13 +306,15 @@ class SpmdPipelineTest(unittest.TestCase):
         (num_stages, jax.device_count() // num_stages), ("stage", "data")
     )
 
+    shardings = Linear.ShardingConfig(
+      w=NamedSharding(mesh, P(None, "data")),
+      b=NamedSharding(mesh, P("data")),
+      a=NamedSharding(mesh, P("data", None))
+    )
     def stage_fn(x):
-      w_sharding = NamedSharding(mesh, P(None, "data"))
-      b_sharding = NamedSharding(mesh, P("data"))
-      a_sharding = NamedSharding(mesh, P("data", None))
-      x = Linear(hidden_dim, mesh=mesh, name="first").with_sharding_constraints(
-          w_sharding, b_sharding, a_sharding
-      )(x)
+      x = Linear(
+        hidden_dim, mesh=mesh, name="first"
+      ).with_sharding_constraints(shardings)(x)
 
       @partial(
           shard_map,
@@ -371,17 +384,19 @@ class SpmdPipelineTest(unittest.TestCase):
         (num_stages, jax.device_count() // num_stages), ("stage", "data")
     )
 
-    def stage_fn(x):
-      w_sharding = NamedSharding(mesh, P(None, "data"))
-      b_sharding = NamedSharding(mesh, P("data"))
-      a_sharding = NamedSharding(mesh, P("data", None))
-      return Linear(hidden_dim, mesh=mesh, name="first").with_sharding_constraints(
-          w_sharding, b_sharding, a_sharding
-      )(x)
+    def stage_fn(x, shardings=None):
+      return Linear(
+        hidden_dim, mesh=mesh, name="first"
+      ).with_sharding_constraints(shardings)(x)
 
+    shardings_in_pp_tp = Linear.ShardingConfig(
+      w=NamedSharding(mesh, P(None, "data")),
+      b=NamedSharding(mesh, P("data")),
+      a=NamedSharding(mesh, P("data", None)),
+    )
     pipelined_fn = hk.transform(
         gpipe_spmd_pipeline(
-            stage_fn,
+            partial(stage_fn, shardings=shardings_in_pp_tp),
             num_stages,
             num_microbatches,
             circular_repeats=circular_repeats,
@@ -401,9 +416,14 @@ class SpmdPipelineTest(unittest.TestCase):
         pipelined_params, key, inp).compile()
 
     # Reference
+    shardings_in_tp = Linear.ShardingConfig(
+      w=NamedSharding(mesh, P(None, ("stage", "data"))),
+      b=NamedSharding(mesh, P(("stage", "data"))),
+      a=NamedSharding(mesh, P(("stage", "data"), None)),
+    )
     eight_stages_fn = hk.transform(
         multi_stages(
-            stage_fn,
+            partial(stage_fn, shardings=shardings_in_tp),
             num_stages=num_stages,
             circular_repeats=circular_repeats)
     )
