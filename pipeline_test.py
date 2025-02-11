@@ -70,6 +70,8 @@ class Linear(hk.Module):
     if self.shardings.w is not None:
       w = jax.lax.with_sharding_constraint(w, self.shardings.w)
     out = jnp.dot(inputs, w)
+    if self.shardings.a is not None:
+      out = jax.lax.with_sharding_constraint(out, self.shardings.a)
     b = hk.get_parameter("b", [self.output_size], dtype, init=self.b_init)
     if self.shardings.b is not None:
       b = jax.lax.with_sharding_constraint(b, self.shardings.b)
@@ -188,12 +190,12 @@ class SpmdPipelineTest(unittest.TestCase):
         (num_stages, jax.device_count() // num_stages), ("stage", "data")
     )
 
-    shardings = Linear.ShardingConfig(
+    shardings_in_pp_tp = Linear.ShardingConfig(
       w=NamedSharding(mesh, P(None, "data")),
       b=NamedSharding(mesh, P("data")),
-      a=NamedSharding(mesh, P("data", None))
+      a=NamedSharding(mesh, P(None, "data")),
     )
-    def stage_fn(x):
+    def stage_fn(x, shardings=None):
       x = Linear(
         hidden_dim, mesh=mesh, name="first"
       ).with_sharding_constraints(shardings)(x)
@@ -204,7 +206,7 @@ class SpmdPipelineTest(unittest.TestCase):
 
     pipelined_fn = hk.transform(
         gpipe_spmd_pipeline(
-            stage_fn,
+            partial(stage_fn, shardings=shardings_in_pp_tp),
             num_stages,
             num_microbatches,
             mesh=mesh,
@@ -219,11 +221,23 @@ class SpmdPipelineTest(unittest.TestCase):
     pipelined_re = jax.jit(pipelined_fn.apply)(pipelined_params, key, inp)
 
     # Reference
-    four_stages_fn = hk.transform(multi_stages(stage_fn, num_stages=num_stages))
-    non_pipelined_params = jax.jit(four_stages_fn.init)(key, inp)
+    shardings_in_tp = Linear.ShardingConfig(
+      w=NamedSharding(mesh, P(None, ("stage", "data"))),
+      b=NamedSharding(mesh, P(("stage", "data"))),
+      a=NamedSharding(mesh, P(None, ("stage", "data"))),
+    )
+    four_stages_fn = hk.transform(
+        multi_stages(
+            partial(stage_fn, shardings=shardings_in_tp),
+            num_stages=num_stages
+        )
+    )
+    in_out_sharding = NamedSharding(mesh, P(None, ("stage", "data")))
+    np_inp = jax.device_put(inp, in_out_sharding)
+    non_pipelined_params = jax.jit(four_stages_fn.init)(key, np_inp)
     non_pipelined_re = jax.jit(
         four_stages_fn.apply)(
-        non_pipelined_params, key, inp)
+        non_pipelined_params, key, np_inp)
 
     self.assert_params_allclose(pipelined_params, non_pipelined_params)
     # TODO: Debug the small numerical differences
@@ -240,19 +254,19 @@ class SpmdPipelineTest(unittest.TestCase):
         (num_stages, jax.device_count() // num_stages), ("stage", "data")
     )
 
-    shardings = Linear.ShardingConfig(
+    shardings_in_pp_tp = Linear.ShardingConfig(
       w=NamedSharding(mesh, P(None, "data")),
       b=NamedSharding(mesh, P("data")),
-      a=NamedSharding(mesh, P("data", None))
+      a=NamedSharding(mesh, P(None, "data")),
     )
-    def stage_fn(x):
+    def stage_fn(x, shardings=None):
       return Linear(
         hidden_dim, mesh=mesh, name="first"
       ).with_sharding_constraints(shardings)(x)
 
     pipelined_fn = hk.transform(
         gpipe_spmd_pipeline(
-            stage_fn,
+            partial(stage_fn, shardings=shardings_in_pp_tp),
             num_stages,
             num_microbatches,
             circular_repeats=circular_repeats,
@@ -270,16 +284,23 @@ class SpmdPipelineTest(unittest.TestCase):
     pipelined_re = jax.jit(pipelined_fn.apply)(pipelined_params, key, inp)
 
     # Reference
+    shardings_in_tp = Linear.ShardingConfig(
+      w=NamedSharding(mesh, P(None, ("stage", "data"))),
+      b=NamedSharding(mesh, P(("stage", "data"))),
+      a=NamedSharding(mesh, P(None, ("stage", "data"))),
+    )
     eight_stages_fn = hk.transform(
         multi_stages(
-            stage_fn,
+            partial(stage_fn, shardings=shardings_in_tp),
             num_stages=num_stages,
             circular_repeats=circular_repeats)
     )
-    non_pipelined_params = jax.jit(eight_stages_fn.init)(key, inp)
+    in_out_sharding = NamedSharding(mesh, P(None, ("stage", "data")))
+    np_inp = jax.device_put(inp, in_out_sharding)
+    non_pipelined_params = jax.jit(eight_stages_fn.init)(key, np_inp)
     non_pipelined_re = jax.jit(
         eight_stages_fn.apply)(
-        non_pipelined_params, key, inp)
+        non_pipelined_params, key, np_inp)
 
     # [0, 4, 1, 5, 2, 6, 3, 7] -> [0, 1, 2, 3, 4, 5, 6, 7]
     original_order = (
@@ -306,12 +327,13 @@ class SpmdPipelineTest(unittest.TestCase):
         (num_stages, jax.device_count() // num_stages), ("stage", "data")
     )
 
-    shardings = Linear.ShardingConfig(
+    shardings_in_pp_tp = Linear.ShardingConfig(
       w=NamedSharding(mesh, P(None, "data")),
       b=NamedSharding(mesh, P("data")),
-      a=NamedSharding(mesh, P("data", None))
+      a=NamedSharding(mesh, P(None, "data")),
     )
-    def stage_fn(x):
+
+    def stage_fn(x, shardings=None):
       x = Linear(
         hidden_dim, mesh=mesh, name="first"
       ).with_sharding_constraints(shardings)(x)
@@ -330,7 +352,7 @@ class SpmdPipelineTest(unittest.TestCase):
 
     pipelined_fn = hk.transform(
         gpipe_spmd_pipeline(
-            stage_fn,
+            partial(stage_fn, shardings=shardings_in_pp_tp),
             num_stages,
             num_microbatches,
             circular_repeats=circular_repeats,
@@ -348,16 +370,23 @@ class SpmdPipelineTest(unittest.TestCase):
     pipelined_re = jax.jit(pipelined_fn.apply)(pipelined_params, key, inp)
 
     # Reference
+    shardings_in_tp = Linear.ShardingConfig(
+      w=NamedSharding(mesh, P(None, ("stage", "data"))),
+      b=NamedSharding(mesh, P(("stage", "data"))),
+      a=NamedSharding(mesh, P(None, ("stage", "data"))),
+    )
     eight_stages_fn = hk.transform(
         multi_stages(
-            stage_fn,
+            partial(stage_fn, shardings=shardings_in_tp),
             num_stages=num_stages,
             circular_repeats=circular_repeats)
     )
-    non_pipelined_params = jax.jit(eight_stages_fn.init)(key, inp)
+    in_out_sharding = NamedSharding(mesh, P(None, ("stage", "data")))
+    np_inp = jax.device_put(inp, in_out_sharding)
+    non_pipelined_params = jax.jit(eight_stages_fn.init)(key, np_inp)
     non_pipelined_re = jax.jit(
         eight_stages_fn.apply)(
-        non_pipelined_params, key, inp)
+        non_pipelined_params, key, np_inp)
 
     # [0, 4, 1, 5, 2, 6, 3, 7] -> [0, 1, 2, 3, 4, 5, 6, 7]
     original_order = (
@@ -392,7 +421,7 @@ class SpmdPipelineTest(unittest.TestCase):
     shardings_in_pp_tp = Linear.ShardingConfig(
       w=NamedSharding(mesh, P(None, "data")),
       b=NamedSharding(mesh, P("data")),
-      a=NamedSharding(mesh, P("data", None)),
+      a=NamedSharding(mesh, P(None, "data")),
     )
     pipelined_fn = hk.transform(
         gpipe_spmd_pipeline(
@@ -419,7 +448,7 @@ class SpmdPipelineTest(unittest.TestCase):
     shardings_in_tp = Linear.ShardingConfig(
       w=NamedSharding(mesh, P(None, ("stage", "data"))),
       b=NamedSharding(mesh, P(("stage", "data"))),
-      a=NamedSharding(mesh, P(("stage", "data"), None)),
+      a=NamedSharding(mesh, P(None, ("stage", "data"))),
     )
     eight_stages_fn = hk.transform(
         multi_stages(
@@ -427,10 +456,13 @@ class SpmdPipelineTest(unittest.TestCase):
             num_stages=num_stages,
             circular_repeats=circular_repeats)
     )
-    non_pipelined_params = jax.jit(eight_stages_fn.init)(key, inp)
+    in_out_sharding = NamedSharding(mesh, P(None, ("stage", "data")))
+    np_inp = jax.device_put(inp, in_out_sharding)
+    non_pipelined_params = jax.jit(eight_stages_fn.init)(key, np_inp)
     non_piplined_apply_fn_aot = jax.jit(
-        eight_stages_fn.apply).lower(
-        non_pipelined_params, key, inp).compile()
+        eight_stages_fn.apply,
+        out_shardings=in_out_sharding).lower(
+        non_pipelined_params, key, np_inp).compile()
 
     # Warmup NCCL
     pipelined_re = pipelined_apply_fn_aot(pipelined_params, key, inp)
@@ -447,7 +479,7 @@ class SpmdPipelineTest(unittest.TestCase):
       results.clear()
       for _ in range(10):
         results.append(
-            non_piplined_apply_fn_aot(non_pipelined_params, key, inp))
+            non_piplined_apply_fn_aot(non_pipelined_params, key, np_inp))
       jax.block_until_ready(results)
 
 
