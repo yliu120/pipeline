@@ -4,19 +4,21 @@ import os
 XLA_FLAGS = [
     "--xla_dump_to=/tmp/hlos",
     "--xla_dump_hlo_pass_re=.*",
-    "--xla_gpu_enable_latency_hiding_scheduler=true",
+    "--xla_gpu_enable_latency_hiding_scheduler=false",
     "--xla_gpu_enable_triton_gemm=false",
     "--xla_gpu_graph_level=0",
-    "--xla_disable_hlo_passes=rematerialization",
+    "--xla_disable_hlo_passes=rematerialization,collective-permute-cycle-decomposer",
     # This flag has been very flaky.
     # "--xla_gpu_use_memcpy_local_p2p=true",
     "--xla_gpu_enable_pipelined_all_gather=true",
     "--xla_gpu_enable_pipelined_reduce_scatter=true",
-    "--xla_gpu_enable_while_loop_double_buffering=true",
+    "--xla_gpu_enable_while_loop_double_buffering=false",
     "--xla_gpu_multi_streamed_windowed_einsum=false",
     # Enable them once we use CP decomposer.
-    # "--xla_gpu_collective_permute_decomposer_threshold=0",
-    # "--xla_gpu_enable_experimental_pipeline_parallelism_opt=true",
+    "--xla_gpu_collective_permute_decomposer_threshold=0",
+    "--xla_gpu_experimental_enable_pipeline_parallelism_opt=true",
+    # Needs this to be fixed.
+    # "--xla_gpu_enable_pipelined_p2p=true",
 ]
 
 os.environ["XLA_FLAGS"] = " ".join(XLA_FLAGS)
@@ -117,6 +119,7 @@ def multi_stages(stage_fn: Callable, num_stages: int = 1,
 
 class SpmdPipelineTest(unittest.TestCase):
   def setUp(self):
+    jax.config.update("jax_use_shardy_partitioner", True)
     if "cpu" in jax.devices()[0].device_kind:
       self.skipTest("Skip this tests on CPU.")
 
@@ -430,7 +433,7 @@ class SpmdPipelineTest(unittest.TestCase):
             num_microbatches,
             circular_repeats=circular_repeats,
             mesh=mesh,
-            microbatch_sharding=P("data"),
+            microbatch_sharding=P(None, "data"),
         )
     )
 
