@@ -105,7 +105,7 @@ def gpipe_spmd_pipeline(
         mesh=mesh,
         in_specs=(p_sharding, P(_STAGE_AXIS), P(None)),
         # Fixes me.
-        out_specs=P(None),
+        out_specs=P(_STAGE_AXIS),
         check_rep=False,
         auto=frozenset(auto_axes),
     )
