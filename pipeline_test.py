@@ -137,12 +137,12 @@ class SpmdPipelineTest(unittest.TestCase):
         (num_stages, jax.device_count() // num_stages), ("stage", "data")
     )
 
-    shardings = Linear.ShardingConfig(
+    shardings_in_pp_tp = Linear.ShardingConfig(
       w=NamedSharding(mesh, P(None, "data")),
       b=NamedSharding(mesh, P("data")),
     )
 
-    def stage_fn(x):
+    def stage_fn(x, shardings=None):
       x = Linear(
         hidden_dim, mesh=mesh, name="first"
       ).with_sharding_constraints(shardings)(x)
@@ -156,11 +156,11 @@ class SpmdPipelineTest(unittest.TestCase):
 
     pipelined_fn = hk.transform(
         gpipe_spmd_pipeline(
-            stage_fn,
+            partial(stage_fn, shardings=shardings_in_pp_tp),
             num_stages,
             num_microbatches,
             mesh=mesh,
-            microbatch_sharding=P("data"),
+            microbatch_sharding=P(None, "data"),
         )
     )
     pipelined_params = jax.jit(pipelined_fn.init)(key, inp)
@@ -208,7 +208,7 @@ class SpmdPipelineTest(unittest.TestCase):
             num_stages,
             num_microbatches,
             mesh=mesh,
-            microbatch_sharding=P("data"),
+            microbatch_sharding=P(None, "data"),
         )
     )
 
@@ -269,7 +269,7 @@ class SpmdPipelineTest(unittest.TestCase):
             num_microbatches,
             circular_repeats=circular_repeats,
             mesh=mesh,
-            microbatch_sharding=P("data"),
+            microbatch_sharding=P(None, "data"),
         )
     )
 
@@ -355,7 +355,7 @@ class SpmdPipelineTest(unittest.TestCase):
             num_microbatches,
             circular_repeats=circular_repeats,
             mesh=mesh,
-            microbatch_sharding=P("data"),
+            microbatch_sharding=P(None, "data"),
         )
     )
 
