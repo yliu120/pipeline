@@ -4,7 +4,7 @@ import os
 XLA_FLAGS = [
     "--xla_dump_to=/tmp/hlos",
     "--xla_dump_hlo_pass_re=.*",
-    "--xla_gpu_enable_latency_hiding_scheduler=false",
+    "--xla_gpu_enable_latency_hiding_scheduler=true",
     "--xla_gpu_enable_triton_gemm=false",
     "--xla_gpu_graph_level=0",
     "--xla_disable_hlo_passes=rematerialization",
@@ -347,8 +347,8 @@ class SpmdPipelineTest(unittest.TestCase):
       @partial(
           shard_map,
           mesh=mesh,
-          in_specs=P("data", None),
-          out_specs=P("data", None),
+          in_specs=P(None, "data"),
+          out_specs=P(None, "data"),
           check_rep=False,
       )
       def f(x):
