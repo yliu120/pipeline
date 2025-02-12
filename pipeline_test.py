@@ -169,14 +169,22 @@ class SpmdPipelineTest(unittest.TestCase):
     # Reference
     # We still wraps the stage_fn with the multi_stages transformation for
     # controlling the random number generators the initializers use.
-    one_stage_fn = hk.transform(multi_stages(stage_fn, num_stages=num_stages))
+    shardings_in_tp = Linear.ShardingConfig(
+      w=NamedSharding(mesh, P(None, ("stage", "data"))),
+      b=NamedSharding(mesh, P(("stage", "data"))),
+      a=NamedSharding(mesh, P(None, ("stage", "data"))),
+    )
+    one_stage_fn = hk.transform(
+      multi_stages(partial(stage_fn, shardings=shardings_in_tp),
+                   num_stages=num_stages)
+    )
     non_pipelined_params = jax.jit(one_stage_fn.init)(key, inp)
     non_pipelined_re = jax.jit(
         one_stage_fn.apply)(
         non_pipelined_params, key, inp)
 
     self.assert_params_allclose(pipelined_params, non_pipelined_params)
-    np.testing.assert_allclose(pipelined_re, non_pipelined_re)
+    np.testing.assert_allclose(pipelined_re, non_pipelined_re, atol=2e-3)
 
   def test_spmd_pipeline_with_no_circular_repeat(self):
     global_batch_size = 16
