@@ -34,25 +34,6 @@ def _pipelined_recv(x: ArrayLike, perm: list[tuple[int]]):
     return jax.lax.precv(x, x, _STAGE_AXIS, perm=perm)
 
 
-def _rotate_state_to_right(x: ArrayLike, num_stages: int = 1):
-  """Rotates the state buffer along its second axis to the right.
-
-  This version only works inside a shard_map call. For instance,
-  The global state array is sharded 4-way as,
-  [0, 4]                 [3, 7]                     [7, 3]
-  [1, 5] Rotate-right >> [0, 4] roll first stage >> [0, 4]
-  [2, 6]                 [1, 5]                     [1, 5]
-  [3, 7]                 [2, 6]                     [2, 6]
-  """
-  if num_stages == 1:
-    return x
-  full_perm = [(i, (i + 1) % num_stages) for i in range(num_stages)]
-  # Manually decomposing collective permute to avoid cycles.
-  x = jax.lax.ppermute(x, _STAGE_AXIS, full_perm)
-  stage_index = jax.lax.axis_index(_STAGE_AXIS)
-  return jnp.where(stage_index == 0, jnp.roll(x, -1, axis=0), x)
-
-
 # Args we carried to the next iteration of the layer scan of the pipeline_fn.
 PipelineCarry = namedtuple(
     "PipelineCarry", [
