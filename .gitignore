@@ -1,2 +1,8 @@
 __pycache__
 .vscode
+
+# Bazel
+bazel-*
+
+# Ruff Cache
+.ruff*

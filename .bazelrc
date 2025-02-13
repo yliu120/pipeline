@@ -1,0 +1,69 @@
+# Make Bazel print out all options from rc files.
+build --announce_rc
+
+# By default, execute all actions locally.
+build --spawn_strategy=local
+
+# Enable host OS specific configs. For instance, "build:linux" will be used
+# automatically when building on Linux.
+build --enable_platform_specific_config
+
+build --experimental_cc_shared_library
+
+# Do not use C-Ares when building gRPC.
+build --define=grpc_no_ares=true
+
+build --define=tsl_link_protobuf=true
+
+# Enable optimization.
+build -c opt
+
+# Suppress all warning messages.
+build --output_filter=DONT_MATCH_ANYTHING
+
+build --copt=-DMLIR_PYTHON_PACKAGE_PREFIX=jaxlib.mlir.
+
+build --verbose_failures=true
+
+# Inherits from JAX/XLA requirements.
+# Build by clang with C++17 standards.
+build --copt=-Wno-gnu-offsetof-extensions
+build --copt=-Qunused-arguments
+build --copt=-Werror=mismatched-tags
+build --copt=-fvisibility=hidden
+build --copt=-Wno-sign-compare
+build --cxxopt=-std=c++17
+build --host_cxxopt=-std=c++17
+build --copt=-mavx
+build --host_copt=-mavx
+
+# CUDA envs
+build --repo_env=TF_NEED_CUDA=1
+build --repo_env=TF_NCCL_USE_STUB=1
+build --repo_env=HERMETIC_CUDA_COMPUTE_CAPABILITIES="sm_80,compute_90"
+build --repo_env=HERMETIC_CUDA_VERSION=12.3.2
+build --repo_env=HERMETIC_CUDNN_VERSION=9.1.1
+build --linkopt="-Wl,--disable-new-dtags"
+build --crosstool_top=@local_config_cuda//crosstool:toolchain
+build --@local_config_cuda//:enable_cuda
+build --@local_config_cuda//cuda:include_cuda_libs=false
+build --@local_config_cuda//:cuda_compiler="clang"
+build --action_env=TF_NVCC_CLANG="1"
+build --@local_config_cuda//:cuda_compiler="nvcc"
+
+common --isatty=1
+common --terminal_columns=187
+common --experimental_repo_remote_exec
+common --nocheck_visibility
+
+########################################################
+# Please modify this compiler links to your host envs.
+########################################################
+build --action_env=CLANG_COMPILER_PATH=/usr/lib/llvm-18/bin/clang
+build --repo_env=CC=/usr/lib/llvm-18/bin/clang
+build --repo_env=BAZEL_COMPILER=/usr/lib/llvm-18/bin/clang
+build --repo_env=LOCAL_CUDA_PATH=/usr/local/cuda
+build --repo_env=LOCAL_CUDNN_PATH=/usr/local/cuda/cudnn
+build --repo_env=LOCAL_NCCL_PATH=/usr/local
+########################################################
+########################################################
