@@ -22,6 +22,18 @@ def _to_microbatches(input: ArrayLike, num_microbatches: int = 1):
   return staged_batch
 
 
+def _pipelined_send(x: ArrayLike, perm: list[tuple[int]]):
+  """Sends the payload to the next stage."""
+  with jax.named_scope("pipelined_send"):
+    return jax.lax.psend(x, None, _STAGE_AXIS, perm=perm)
+
+
+def _pipelined_recv(x: ArrayLike, perm: list[tuple[int]]):
+  """Sends the payload to the next stage."""
+  with jax.named_scope("pipelined_recv"):
+    return jax.lax.precv(x, x, _STAGE_AXIS, perm=perm)
+
+
 def _rotate_state_to_right(x: ArrayLike, num_stages: int = 1):
   """Rotates the state buffer along its second axis to the right.
 
@@ -36,19 +48,17 @@ def _rotate_state_to_right(x: ArrayLike, num_stages: int = 1):
     return x
   full_perm = [(i, (i + 1) % num_stages) for i in range(num_stages)]
   # Manually decomposing collective permute to avoid cycles.
-  stage_zero_recv = jax.lax.ppermute(x, _STAGE_AXIS, [full_perm[-1]])
-  other_stages_recv = jax.lax.ppermute(x, _STAGE_AXIS, full_perm[:-1])
+  x = jax.lax.ppermute(x, _STAGE_AXIS, full_perm)
   stage_index = jax.lax.axis_index(_STAGE_AXIS)
-  return jnp.where(stage_index == 0,
-                   jnp.roll(stage_zero_recv, -1, axis=0),
-                   other_stages_recv)
+  return jnp.where(stage_index == 0, jnp.roll(x, -1, axis=0), x)
 
 
 # Args we carried to the next iteration of the layer scan of the pipeline_fn.
 PipelineCarry = namedtuple(
     "PipelineCarry", [
         # Intermediate activations
-        "states",
+        "states_from_prev",
+        "states_to_next",
         # Outputs
         "outputs",
         # Loop index
@@ -99,6 +109,8 @@ def gpipe_spmd_pipeline(
 
   def pipelined_apply_fn(staged_params, staged_keys, staged_inputs):
     p_sharding = _per_stage_params_sharding(staged_inputs[0])
+    # Permutation across stages.
+    full_perm = [(i, (i + 1) % num_stages) for i in range(num_stages)]
 
     @partial(
         shard_map,
@@ -150,7 +162,9 @@ def gpipe_spmd_pipeline(
       num_iterations = num_microbatches * circular_repeats + num_stages - 1
 
       def _compute_fn(c: PipelineCarry):
-        states, outputs, i = c.states, c.outputs, c.i
+        states, outputs, i = c.states_from_prev, c.outputs, c.i
+        with jax.named_scope("rotate_after_recv"):
+          states = jnp.where(stage_index == 0, jnp.roll(states, -1, axis=0), states)
         cr_idx = jnp.minimum(
             (i - stage_index) // num_microbatches, circular_repeats - 1
         )
@@ -170,6 +184,8 @@ def gpipe_spmd_pipeline(
         states = states.at[0].set(
             jnp.where(stage_index == 0, first_stage_input, states[0])
         )
+        # Hack! don't dce sent
+        states = states + c.states_to_next * 1E-10
 
         # Run stage function for this virtual stage.
         states = states.at[0].set(stage_apply(cr_params, keys[cr_idx], states[0]))
@@ -203,27 +219,49 @@ def gpipe_spmd_pipeline(
       #   ...                                # The last epilogue
       def _body_fn(c: PipelineCarry, _):
         # Parameters for the current virtual stage.
-        states, outputs = _compute_fn(
+        sent = _pipelined_send(c.states_to_next, full_perm)
+        states_to_next, outputs = _compute_fn(
             PipelineCarry(
-                states=c.states,
+                states_from_prev=c.states_from_prev,
+                # Hack! Don't DCE this send.
+                states_to_next=sent,
                 outputs=c.outputs,
                 i=c.i
             )
         )
-        with jax.named_scope("ppermute_states"):
-          states = _rotate_state_to_right(states, num_stages=num_stages)
-        return PipelineCarry(states=states, outputs=outputs, i=c.i + 1), None
+        states_from_prev = _pipelined_recv(sent, full_perm)
+        return PipelineCarry(
+            states_from_prev=states_from_prev,
+            states_to_next=states_to_next,
+            outputs=outputs,
+            i=c.i + 1), None
+
+      with jax.named_scope("peeled_first_iter"):
+        sent = _pipelined_send(states, [full_perm[-1]])
+        states_to_next, outputs = _compute_fn(
+            PipelineCarry(
+                states_from_prev=sent,
+                states_to_next=sent,
+                outputs=outputs,
+                i=0,
+            )
+        )
+        states_from_prev = _pipelined_recv(sent, full_perm)
 
       final_carry, _ = jax.lax.scan(
           _body_fn,
           PipelineCarry(
-              states=states,
+              states_from_prev=states_from_prev,
+              states_to_next=states_to_next,
               outputs=outputs,
-              i=0
+              i=1
           ),
-          length=num_iterations,
+          length=num_iterations-1,
       )
-      return final_carry.outputs
+
+      with jax.named_scope("peeled_last_send"):
+        sent = _pipelined_send(final_carry.states_to_next, full_perm[:-1])
+      return final_carry.outputs + jnp.sum(sent) * 1E-10
 
     return _apply(staged_params, staged_keys, staged_inputs)
 
