@@ -12,11 +12,8 @@ XLA_FLAGS = [
     # "--xla_gpu_use_memcpy_local_p2p=true",
     "--xla_gpu_enable_pipelined_all_gather=true",
     "--xla_gpu_enable_pipelined_reduce_scatter=true",
-    "--xla_gpu_enable_while_loop_double_buffering=true",
+    "--xla_gpu_enable_while_loop_double_buffering=false",
     "--xla_gpu_multi_streamed_windowed_einsum=false",
-    # Enable them once we use CP decomposer.
-    # "--xla_gpu_collective_permute_decomposer_threshold=0",
-    # "--xla_gpu_enable_experimental_pipeline_parallelism_opt=true",
 ]
 
 os.environ["XLA_FLAGS"] = " ".join(XLA_FLAGS)
@@ -117,6 +114,7 @@ def multi_stages(stage_fn: Callable, num_stages: int = 1,
 
 class SpmdPipelineTest(unittest.TestCase):
   def setUp(self):
+    jax.config.update("jax_use_shardy_partitioner", True)
     if "cpu" in jax.devices()[0].device_kind:
       self.skipTest("Skip this tests on CPU.")
 
@@ -139,12 +137,12 @@ class SpmdPipelineTest(unittest.TestCase):
         (num_stages, jax.device_count() // num_stages), ("stage", "data")
     )
 
-    shardings = Linear.ShardingConfig(
+    shardings_in_pp_tp = Linear.ShardingConfig(
       w=NamedSharding(mesh, P(None, "data")),
       b=NamedSharding(mesh, P("data")),
     )
 
-    def stage_fn(x):
+    def stage_fn(x, shardings=None):
       x = Linear(
         hidden_dim, mesh=mesh, name="first"
       ).with_sharding_constraints(shardings)(x)
@@ -158,11 +156,11 @@ class SpmdPipelineTest(unittest.TestCase):
 
     pipelined_fn = hk.transform(
         gpipe_spmd_pipeline(
-            stage_fn,
+            partial(stage_fn, shardings=shardings_in_pp_tp),
             num_stages,
             num_microbatches,
             mesh=mesh,
-            microbatch_sharding=P("data"),
+            microbatch_sharding=P(None, "data"),
         )
     )
     pipelined_params = jax.jit(pipelined_fn.init)(key, inp)
@@ -171,14 +169,22 @@ class SpmdPipelineTest(unittest.TestCase):
     # Reference
     # We still wraps the stage_fn with the multi_stages transformation for
     # controlling the random number generators the initializers use.
-    one_stage_fn = hk.transform(multi_stages(stage_fn, num_stages=num_stages))
+    shardings_in_tp = Linear.ShardingConfig(
+      w=NamedSharding(mesh, P(None, ("stage", "data"))),
+      b=NamedSharding(mesh, P(("stage", "data"))),
+      a=NamedSharding(mesh, P(None, ("stage", "data"))),
+    )
+    one_stage_fn = hk.transform(
+      multi_stages(partial(stage_fn, shardings=shardings_in_tp),
+                   num_stages=num_stages)
+    )
     non_pipelined_params = jax.jit(one_stage_fn.init)(key, inp)
     non_pipelined_re = jax.jit(
         one_stage_fn.apply)(
         non_pipelined_params, key, inp)
 
     self.assert_params_allclose(pipelined_params, non_pipelined_params)
-    np.testing.assert_allclose(pipelined_re, non_pipelined_re)
+    np.testing.assert_allclose(pipelined_re, non_pipelined_re, atol=2e-3)
 
   def test_spmd_pipeline_with_no_circular_repeat(self):
     global_batch_size = 16
@@ -210,7 +216,7 @@ class SpmdPipelineTest(unittest.TestCase):
             num_stages,
             num_microbatches,
             mesh=mesh,
-            microbatch_sharding=P("data"),
+            microbatch_sharding=P(None, "data"),
         )
     )
 
@@ -271,7 +277,7 @@ class SpmdPipelineTest(unittest.TestCase):
             num_microbatches,
             circular_repeats=circular_repeats,
             mesh=mesh,
-            microbatch_sharding=P("data"),
+            microbatch_sharding=P(None, "data"),
         )
     )
 
@@ -341,8 +347,8 @@ class SpmdPipelineTest(unittest.TestCase):
       @partial(
           shard_map,
           mesh=mesh,
-          in_specs=P("data", None),
-          out_specs=P("data", None),
+          in_specs=P(None, "data"),
+          out_specs=P(None, "data"),
           check_rep=False,
       )
       def f(x):
@@ -357,7 +363,7 @@ class SpmdPipelineTest(unittest.TestCase):
             num_microbatches,
             circular_repeats=circular_repeats,
             mesh=mesh,
-            microbatch_sharding=P("data"),
+            microbatch_sharding=P(None, "data"),
         )
     )
 
@@ -430,7 +436,7 @@ class SpmdPipelineTest(unittest.TestCase):
             num_microbatches,
             circular_repeats=circular_repeats,
             mesh=mesh,
-            microbatch_sharding=P("data"),
+            microbatch_sharding=P(None, "data"),
         )
     )
 

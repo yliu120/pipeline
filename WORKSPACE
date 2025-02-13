@@ -4,13 +4,13 @@ load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
 
 git_repository(
     name = "xla",
-    commit = "2b2a5e8e45ae40512cd4ab216c3984e28887a4a3",
+    commit = "5b43cc241bf8a9738405e3957e8878e31f1e1869",
     remote = "https://github.com/yliu120/xla.git",
 )
 
 git_repository(
     name = "jax-src",
-    commit = "7b1a4f85849000580e685a7048be389c03f5ee50",
+    commit = "53de868968ed5f6714bfbbbbde30f60236f45866",
     remote = "https://github.com/yliu120/jax.git",
 )
 
