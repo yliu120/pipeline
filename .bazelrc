@@ -51,15 +51,19 @@ build --@local_config_cuda//:cuda_compiler="clang"
 build --action_env=TF_NVCC_CLANG="1"
 build --@local_config_cuda//:cuda_compiler="nvcc"
 
+common --isatty=1
+common --terminal_columns=187
+common --experimental_repo_remote_exec
+common --nocheck_visibility
+
+########################################################
 # Please modify this compiler links to your host envs.
+########################################################
 build --action_env=CLANG_COMPILER_PATH=/usr/lib/llvm-18/bin/clang
 build --repo_env=CC=/usr/lib/llvm-18/bin/clang
 build --repo_env=BAZEL_COMPILER=/usr/lib/llvm-18/bin/clang
 build --repo_env=LOCAL_CUDA_PATH=/usr/local/cuda
 build --repo_env=LOCAL_CUDNN_PATH=/usr/local/cuda/cudnn
 build --repo_env=LOCAL_NCCL_PATH=/usr/local
-
-common --isatty=1
-common --terminal_columns=187
-common --experimental_repo_remote_exec
-common --nocheck_visibility
+########################################################
+########################################################
