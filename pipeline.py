@@ -186,18 +186,6 @@ def gpipe_spmd_pipeline(
         return states, outputs
 
       # Pipeline collective permutes for states.
-      # The natural way to write the loop is the following:
-      #   for i in range(num_iterations):
-      #     inps, s, oups = _compute_fn(c)
-      #     s = _epilogue_fn(s)
-      #
-      # To overlap the state permutes with the compute, we can manually pipeline
-      # the above loop:
-      #   inps, s, oups = _compute_fn(c)     # Iteration K's compute
-      #   for i in range(1, num_iterations):
-      #     s = _epilogue_fn(s)              # Iteration K's epilogue
-      #     inps, s, oups = _compute_fn(c)   # Iteration K+1's compute
-      #   ...                                # The last epilogue
       def _body_fn(c: PipelineCarry, _):
         # Parameters for the current virtual stage.
         sent = _pipelined_send(c.states_to_next, full_perm)

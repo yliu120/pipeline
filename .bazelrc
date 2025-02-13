@@ -43,6 +43,7 @@ build --repo_env=TF_NCCL_USE_STUB=1
 build --repo_env=HERMETIC_CUDA_COMPUTE_CAPABILITIES="sm_80,compute_90"
 build --repo_env=HERMETIC_CUDA_VERSION=12.3.2
 build --repo_env=HERMETIC_CUDNN_VERSION=9.1.1
+build --repo_env=HERMETIC_PYTHON_VERSION=3.10
 build --linkopt="-Wl,--disable-new-dtags"
 build --crosstool_top=@local_config_cuda//crosstool:toolchain
 build --@local_config_cuda//:enable_cuda
