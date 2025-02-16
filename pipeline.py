@@ -44,10 +44,9 @@ def _rotate_left(x: ArrayLike, num_stages: int = 1):
   """
   if num_stages == 1:
     return x
-  xs = list(jnp.unstack(x))
+  first_col = x[0]
   left = [(i, (i - 1) % num_stages) for i in range(num_stages)]
-  xs[0] = jax.lax.ppermute(xs[0], _STAGE_AXIS, left)
-  x = jnp.stack(xs)
+  x = x.at[0].set(jax.lax.ppermute(first_col, _STAGE_AXIS, left))
   return jnp.roll(x, -1, axis=0)
 
 
