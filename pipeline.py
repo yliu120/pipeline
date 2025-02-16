@@ -96,6 +96,39 @@ def gpipe_spmd_pipeline(
     @partial(
         shard_map,
         mesh=mesh,
+        in_specs=(P(), P(), P(None, None, None)),
+        out_specs=P(None, None, None),
+        check_rep=False
+    )
+    def _print_recv(stage_index, i, tensor):
+        jax.debug.print("stage_index: {s}, iteration: {i}, recv: {t}", s=stage_index, i=i, t=tensor)
+        return tensor
+    
+    @partial(
+        shard_map,
+        mesh=mesh,
+        in_specs=(P(), P(), P(None, None, None)),
+        out_specs=P(None, None, None),
+        check_rep=False
+    )
+    def _print_send(stage_index, i, tensor):
+        jax.debug.print("stage_index: {s}, iteration: {i}, send: {t}", s=stage_index, i=i, t=tensor)
+        return tensor
+    
+    @partial(
+        shard_map,
+        mesh=mesh,
+        in_specs=(P(), P(), P(None, None, None)),
+        out_specs=P(None, None, None),
+        check_rep=False
+    )
+    def _print_output(stage_index, i, tensor):
+        jax.debug.print("stage_index: {s}, iteration: {i}, output: {t}", s=stage_index, i=i, t=tensor)
+        return tensor
+
+    @partial(
+        shard_map,
+        mesh=mesh,
         in_specs=(p_sharding, P(_STAGE_AXIS), P(None)),
         # Fixes me.
         out_specs=P(_STAGE_AXIS),
@@ -127,9 +160,9 @@ def gpipe_spmd_pipeline(
       )
       #  ==> Shape (num_microbatch / num_stages, microbatch_size, ...)
       #  For safety purpose, we pollute the garbage values with nans.
-      states = jnp.zeros(
+      states = jnp.ones(
           (num_microbatches // num_stages, *output_shape_per_microbatch.shape),
-          dtype=staged_inputs.dtype) * jnp.nan
+          dtype=staged_inputs.dtype) * 0.0
       # Here assume only one output tensor.
       outputs = jnp.zeros(
           (num_microbatches, *output_shape_per_microbatch.shape),
@@ -144,8 +177,6 @@ def gpipe_spmd_pipeline(
 
       def _compute_fn(c: PipelineCarry):
         states, outputs, i = c.states_from_prev, c.outputs, c.i
-        with jax.named_scope("rotate_after_recv"):
-          states = jnp.where(stage_index == 0, jnp.roll(states, -1, axis=0), states)
         cr_idx = jnp.minimum(
             (i - stage_index) // num_microbatches, circular_repeats - 1
         )
@@ -166,7 +197,7 @@ def gpipe_spmd_pipeline(
             jnp.where(stage_index == 0, first_stage_input, states[0])
         )
         # Hack! don't dce sent
-        states = states + c.states_to_next * 1E-10
+        states = states + c.states_to_next * 0.0
 
         # Run stage function for this virtual stage.
         states = states.at[0].set(stage_apply(cr_params, keys[cr_idx], states[0]))
@@ -187,18 +218,26 @@ def gpipe_spmd_pipeline(
 
       # Pipeline collective permutes for states.
       def _body_fn(c: PipelineCarry, _):
-        # Parameters for the current virtual stage.
+        with jax.named_scope("rotate_after_recv"):
+          states_from_prev = jnp.where(stage_index == 0,
+              jnp.roll(c.states_from_prev, -1, axis=0), c.states_from_prev)
+        states_from_prev = _print_recv(stage_index, c.i, states_from_prev)
         sent = _pipelined_send(c.states_to_next, full_perm)
+        sent = _print_send(stage_index, c.i, sent)
+        # The above code finishes a round of rotating states to the right.
+
         states_to_next, outputs = _compute_fn(
             PipelineCarry(
-                states_from_prev=c.states_from_prev,
+                states_from_prev=states_from_prev,
                 # Hack! Don't DCE this send.
                 states_to_next=sent,
                 outputs=c.outputs,
                 i=c.i
             )
         )
+        outputs = _print_output(stage_index, c.i, outputs)
         states_from_prev = _pipelined_recv(sent, full_perm)
+
         return PipelineCarry(
             states_from_prev=states_from_prev,
             states_to_next=states_to_next,
@@ -206,17 +245,15 @@ def gpipe_spmd_pipeline(
             i=c.i + 1), None
 
       with jax.named_scope("peeled_first_iter"):
-        sent = _pipelined_send(states, [full_perm[-1]])
         states_to_next, outputs = _compute_fn(
             PipelineCarry(
-                states_from_prev=sent,
-                states_to_next=sent,
+                states_from_prev=states,
+                states_to_next=states,
                 outputs=outputs,
                 i=0,
             )
         )
-        states_from_prev = _pipelined_recv(sent, full_perm)
-
+        states_from_prev = _pipelined_recv(states, full_perm[:-1])
       final_carry, _ = jax.lax.scan(
           _body_fn,
           PipelineCarry(
@@ -227,10 +264,11 @@ def gpipe_spmd_pipeline(
           ),
           length=num_iterations-1,
       )
+      # jax.debug.print("final outputs: {o}", o=final_carry.outputs)
 
       with jax.named_scope("peeled_last_send"):
         sent = _pipelined_send(final_carry.states_to_next, full_perm[:-1])
-      return final_carry.outputs + jnp.sum(sent) * 1E-10
+      return final_carry.outputs + jnp.sum(sent) * 0.0
 
     return _apply(staged_params, staged_keys, staged_inputs)
 
@@ -246,14 +284,14 @@ def gpipe_spmd_pipeline(
     #    Device 0: 0     2
     #    Device 1:    1     3
     staged_keys = (
-        hk.next_rng_keys(num_repeated_stages).reshape(-1,
-                                                      num_stages).transpose()
+        hk.next_rng_keys(num_repeated_stages).reshape(
+            -1, num_stages).transpose()
     )
     lifted_init = hk.transparent_lift(pipelined_init_fn)
     # The final shape of each leave of the pytree will be (NUM_STAGE * CIRCULAR_REPEAT, ...)
     # After we shard the params with P('stage'), each stage will receive a circular_repeats
-    # number of sets. In the above example, stage 0 will receive [params_0,
-    # params_2].
+    # number of sets. In the above example, stage 0 will receive
+    # [params_0, params_2].
     stage_params = lifted_init(staged_keys, staged_inputs)
     outputs = pipelined_apply_fn(stage_params, staged_keys, staged_inputs)
     return jax.tree.map(lambda x, ref: x.reshape(ref.shape),

@@ -66,5 +66,8 @@ build --repo_env=BAZEL_COMPILER=/usr/lib/llvm-18/bin/clang
 build --repo_env=LOCAL_CUDA_PATH=/usr/local/cuda
 build --repo_env=LOCAL_CUDNN_PATH=/usr/local/cuda/cudnn
 build --repo_env=LOCAL_NCCL_PATH=/usr/local
+# For local dev
+common --override_repository=jax-src=/data/yunlongl/workspace/jax
+common --override_repository=xla=/data/yunlongl/workspace/xla
 ########################################################
 ########################################################
