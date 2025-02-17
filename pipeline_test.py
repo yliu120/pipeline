@@ -129,7 +129,7 @@ class SpmdPipelineTest(unittest.TestCase):
 
   def test_degenerated_case(self):
     global_batch_size = 16
-    hidden_dim = 1024
+    hidden_dim = 8
     num_stages = 1
     num_microbatches = 1
 
@@ -188,7 +188,7 @@ class SpmdPipelineTest(unittest.TestCase):
 
   def test_spmd_pipeline_with_no_circular_repeat(self):
     global_batch_size = 16
-    hidden_dim = 1024
+    hidden_dim = 8
     num_stages = 4
     num_microbatches = 8
 
@@ -246,8 +246,7 @@ class SpmdPipelineTest(unittest.TestCase):
         non_pipelined_params, key, np_inp)
 
     self.assert_params_allclose(pipelined_params, non_pipelined_params)
-    # TODO: Debug the small numerical differences
-    np.testing.assert_allclose(pipelined_re, non_pipelined_re, atol=2e-3)
+    np.testing.assert_allclose(pipelined_re, non_pipelined_re)
 
   def test_spmd_pipeline_with_circular_repeat(self):
     global_batch_size = 8
@@ -288,55 +287,46 @@ class SpmdPipelineTest(unittest.TestCase):
     # distributed to the stages in a circular manner.
     pipelined_params = jax.jit(pipelined_fn.init)(key, inp)
     pipelined_re = jax.jit(pipelined_fn.apply)(pipelined_params, key, inp)
-    jax.block_until_ready(pipelined_re)
 
     # Reference
-    # shardings_in_tp = Linear.ShardingConfig(
-    #   w=NamedSharding(mesh, P(None, ("stage", "data"))),
-    #   b=NamedSharding(mesh, P(("stage", "data"))),
-    #   a=NamedSharding(mesh, P(None, ("stage", "data"))),
-    # )
-    # eight_stages_fn = hk.transform(
-    #     multi_stages(
-    #         partial(stage_fn, shardings=shardings_in_tp),
-    #         num_stages=num_stages,
-    #         circular_repeats=circular_repeats)
-    # )
-    # in_out_sharding = NamedSharding(mesh, P(None, ("stage", "data")))
-    # np_inp = jax.device_put(inp, in_out_sharding)
-    # non_pipelined_params = jax.jit(eight_stages_fn.init)(key, np_inp)
-    # non_pipelined_re = jax.jit(
-    #     eight_stages_fn.apply)(
-    #     non_pipelined_params, key, np_inp)
-    # import sys
-    # np.set_printoptions(suppress=True)
-    # np.set_printoptions(threshold=sys.maxsize)
-    # print(non_pipelined_re)
+    shardings_in_tp = Linear.ShardingConfig(
+      w=NamedSharding(mesh, P(None, ("stage", "data"))),
+      b=NamedSharding(mesh, P(("stage", "data"))),
+      a=NamedSharding(mesh, P(None, ("stage", "data"))),
+    )
+    eight_stages_fn = hk.transform(
+        multi_stages(
+            partial(stage_fn, shardings=shardings_in_tp),
+            num_stages=num_stages,
+            circular_repeats=circular_repeats)
+    )
+    in_out_sharding = NamedSharding(mesh, P(None, ("stage", "data")))
+    np_inp = jax.device_put(inp, in_out_sharding)
+    non_pipelined_params = jax.jit(eight_stages_fn.init)(key, np_inp)
+    non_pipelined_re = jax.jit(
+        eight_stages_fn.apply)(
+        non_pipelined_params, key, np_inp)
 
     # [0, 4, 1, 5, 2, 6, 3, 7] -> [0, 1, 2, 3, 4, 5, 6, 7]
-    # original_order = (
-    #     np.arange(num_stages * circular_repeats)
-    #     .reshape(num_stages, circular_repeats)
-    #     .transpose()
-    #     .reshape(-1)
-    # )
-    # self.assert_params_allclose(
-    #     jax.tree.map(lambda x: x[original_order], pipelined_params),
-    #     non_pipelined_params,
-    # )
-    # import sys
-    # np.set_printoptions(suppress=True)
-    # np.set_printoptions(threshold=sys.maxsize)
-    # print(pipelined_re)
-    # # TODO: Debug the small numerical differences
-    # np.testing.assert_allclose(pipelined_re, non_pipelined_re, atol=2e-3)
+    original_order = (
+        np.arange(num_stages * circular_repeats)
+        .reshape(num_stages, circular_repeats)
+        .transpose()
+        .reshape(-1)
+    )
+    self.assert_params_allclose(
+        jax.tree.map(lambda x: x[original_order], pipelined_params),
+        non_pipelined_params,
+    )
+    # TODO: Debug the small numerical differences
+    np.testing.assert_allclose(pipelined_re, non_pipelined_re)
 
   def test_spmd_pipeline_with_nested_shard_map(self):
-    global_batch_size = 16
-    hidden_dim = 1024
+    global_batch_size = 32
+    hidden_dim = 8
     num_stages = 4
     num_microbatches = 8
-    circular_repeats = 2
+    circular_repeats = 4
 
     mesh = jax.make_mesh(
         (num_stages, jax.device_count() // num_stages), ("stage", "data")
@@ -415,7 +405,7 @@ class SpmdPipelineTest(unittest.TestCase):
         non_pipelined_params,
     )
     # TODO: Debug the small numerical differences
-    np.testing.assert_allclose(pipelined_re, non_pipelined_re, atol=2e-3)
+    np.testing.assert_allclose(pipelined_re, non_pipelined_re)
 
   def test_pipeline_performance(self):
     global_batch_size = 32

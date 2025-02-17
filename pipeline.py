@@ -13,6 +13,25 @@ from jax.typing import ArrayLike
 _STAGE_AXIS = "stage"
 
 
+### Debugging Utils ###
+# Currently, we need to go from partial-auto to full manual for
+# printing. This won't be needed until jax.debug.print is fixed.
+# The following is an example.
+#
+# @partial(
+#     shard_map,
+#     mesh=mesh,
+#     in_specs=(P(), P(), P(None, None)),
+#     out_specs=P(None, None),
+#     check_rep=False
+# )
+# def _print_output2(stage_index, i, tensor):
+#     jax.debug.print("stage_index: {s}, iteration: {i}, debug tensor: {t}",
+#                     s=stage_index, i=i, t=tensor)
+#     return tensor
+### 
+
+
 def _to_microbatches(input: ArrayLike, num_microbatches: int = 1):
   # The data batch needs to be in shape of (NUM_MICROBATCHES, MICROBATCH_SIZE, NUM_FEATURES)
   global_batch_size = input.shape[0]
@@ -96,50 +115,6 @@ def gpipe_spmd_pipeline(
     @partial(
         shard_map,
         mesh=mesh,
-        in_specs=(P(), P(), P(None, None, None)),
-        out_specs=P(None, None, None),
-        check_rep=False
-    )
-    def _print_recv(stage_index, i, tensor):
-        jax.debug.print("stage_index: {s}, iteration: {i}, recv: {t}", s=stage_index, i=i, t=tensor)
-        return tensor
-    
-    @partial(
-        shard_map,
-        mesh=mesh,
-        in_specs=(P(), P(), P(None, None, None)),
-        out_specs=P(None, None, None),
-        check_rep=False
-    )
-    def _print_send(stage_index, i, tensor):
-        jax.debug.print("stage_index: {s}, iteration: {i}, send: {t}", s=stage_index, i=i, t=tensor)
-        return tensor
-    
-    @partial(
-        shard_map,
-        mesh=mesh,
-        in_specs=(P(), P(), P(None, None, None)),
-        out_specs=P(None, None, None),
-        check_rep=False
-    )
-    def _print_output(stage_index, i, tensor):
-        jax.debug.print("stage_index: {s}, iteration: {i}, output: {t}", s=stage_index, i=i, t=tensor)
-        return tensor
-    
-    @partial(
-        shard_map,
-        mesh=mesh,
-        in_specs=(P(), P(), P(None, None)),
-        out_specs=P(None, None),
-        check_rep=False
-    )
-    def _print_output2(stage_index, i, tensor):
-        jax.debug.print("stage_index: {s}, iteration: {i}, output: {t}", s=stage_index, i=i, t=tensor)
-        return tensor
-
-    @partial(
-        shard_map,
-        mesh=mesh,
         in_specs=(p_sharding, P(_STAGE_AXIS), P(None)),
         # Fixes me.
         out_specs=P(_STAGE_AXIS),
@@ -169,11 +144,10 @@ def gpipe_spmd_pipeline(
           keys[0],
           staged_inputs[0],
       )
-      #  ==> Shape (num_microbatch / num_stages, microbatch_size, ...)
-      #  For safety purpose, we pollute the garbage values with nans.
-      states = jnp.ones(
-          (num_microbatches // num_stages, *output_shape_per_microbatch.shape),
-          dtype=staged_inputs.dtype) * 0.0
+      # Represents input/output states per iteration.
+      states = jnp.zeros(
+          output_shape_per_microbatch.shape,
+          dtype=staged_inputs.dtype)
       # Here assume only one output tensor.
       outputs = jnp.zeros(
           (num_microbatches, *output_shape_per_microbatch.shape),
@@ -187,7 +161,7 @@ def gpipe_spmd_pipeline(
       num_iterations = num_microbatches * circular_repeats + num_stages - 1
 
       def _compute_fn(c: PipelineCarry):
-        states, outputs, i = c.states_from_prev, c.outputs, c.i
+        states, outs, i = c.states_from_prev, c.outputs, c.i
         cr_idx = jnp.minimum(
             (i - stage_index) // num_microbatches, circular_repeats - 1
         )
@@ -197,62 +171,64 @@ def gpipe_spmd_pipeline(
 
         # Input for this virtual stage (a repeat inside a stage).
         # Only stage 0 picks up from the first position of the microbatches as input
-        # because we always rotate all the staged inputs after one virtual stage.
-        # Other stages always pick up activations or garbage values.
+        # or activations stores in the outputs from the previous circular repeats.
         first_stage_input = jnp.where(
             i < num_microbatches,
             jax.lax.dynamic_slice_in_dim(staged_inputs, i, 1)[0],
-            states[0]
+            jax.lax.dynamic_slice_in_dim(outs, i % num_microbatches, 1)[0],
         )
-        states = states.at[0].set(
-            jnp.where(stage_index == 0, first_stage_input, states[0])
-        )
-        # Hack! don't dce sent
+        states = jnp.where(stage_index == 0, first_stage_input, states)
+        # Hack! Defines scopes for states_to_next as it doesn't have any use.
         states = states + c.states_to_next * 0.0
 
         # Run stage function for this virtual stage.
-        states = states.at[0].set(stage_apply(cr_params, keys[cr_idx], states[0]))
+        states = stage_apply(cr_params, keys[cr_idx], states)
 
-        # Rotate and write output before we rotate states.
-        output = jnp.where(
+        # Optimizes these with a custom pallas kernel.
+        # The XLA representation of selective updates are very inefficient.
+        out_index = (i - output_start_idx) % num_microbatches
+        out = jnp.where(
             (stage_index == num_stages - 1) & (i >= output_start_idx),
-            states[0],
-            outputs[0]
+            states,
+            outs[out_index]
         )
-        outputs = jax.lax.dynamic_update_slice_in_dim(
-          outputs,
-          output[None],
-          (i - output_start_idx) % num_microbatches,
-          axis=0,
+        outs = jax.lax.dynamic_update_slice_in_dim(
+            outs, out[None], out_index, axis=0,
         )
-        return states, outputs
+        return states, outs
 
-      # Pipeline collective permutes for states.
+      # Steady phase was implemented with scan layers as every phase has
+      # roughly same steps.
       def _body_fn(c: PipelineCarry, _):
-        with jax.named_scope("rotate_after_recv"):
-          states_from_prev = jnp.where(stage_index == 0,
-              jnp.roll(c.states_from_prev, -1, axis=0), c.states_from_prev)
-        states_from_prev = _print_recv(stage_index, c.i, states_from_prev)
+        # For stage 0, places the pipelined circular repeat output in outputs.
+        # Offsets the index by 1 to the left as the value was received in the
+        # last iteration.
+        save_index = (c.i - 1 - num_stages) % num_microbatches
+        outs = jax.lax.dynamic_update_slice_in_dim(
+            c.outputs,
+            jnp.where(
+                stage_index == 0, c.states_from_prev, c.outputs[save_index]
+            )[None],
+            save_index,
+            axis=0,
+        )
         sent = _pipelined_send(c.states_to_next, full_perm)
-        # sent = _print_send(stage_index, c.i, sent)
         # The above code finishes a round of rotating states to the right.
 
-        states_to_next, outputs = _compute_fn(
+        states_to_next, outs = _compute_fn(
             PipelineCarry(
-                states_from_prev=states_from_prev,
+                states_from_prev=c.states_from_prev,
                 # Hack! Don't DCE this send.
                 states_to_next=sent,
-                outputs=c.outputs,
+                outputs=outs,
                 i=c.i
             )
         )
-        # outputs = _print_output2(stage_index, c.i, states_to_next)
         states_from_prev = _pipelined_recv(sent, full_perm)
-
         return PipelineCarry(
             states_from_prev=states_from_prev,
             states_to_next=states_to_next,
-            outputs=outputs,
+            outputs=outs,
             i=c.i + 1), None
 
       states_from_prev = states
@@ -263,19 +239,17 @@ def gpipe_spmd_pipeline(
         # first i stages to avoid reading garbage values.
         with jax.named_scope(f"peeled_iter_{i}"):
           sent = _pipelined_send(states_to_next, full_perm[:i])
-          states_to_next = jnp.where(stage_index <= i,
-              _compute_fn(
-                  PipelineCarry(
-                      states_from_prev=states_from_prev,
-                      states_to_next=sent,
-                      outputs=outputs,
-                      i=i,
-                  ))[0],
-              states_to_next
-          )
+          states_to_next, outputs = _compute_fn(
+              PipelineCarry(
+                  states_from_prev=states_from_prev,
+                  states_to_next=sent,
+                  outputs=outputs,
+                  i=i,
+              ))
           # The first stage won't be a receiver in all peeled layers.
           states_from_prev = _pipelined_recv(sent,
-              full_perm[:(i+1)] if i != num_stages - 1 else full_perm[:i])
+              full_perm[:(i+1)] if i != num_stages - 1 else full_perm[:i]
+          )
 
       # 2. Steady phase.
       final_carry, _ = jax.lax.scan(
