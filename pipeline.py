@@ -125,6 +125,17 @@ def gpipe_spmd_pipeline(
     def _print_output(stage_index, i, tensor):
         jax.debug.print("stage_index: {s}, iteration: {i}, output: {t}", s=stage_index, i=i, t=tensor)
         return tensor
+    
+    @partial(
+        shard_map,
+        mesh=mesh,
+        in_specs=(P(), P(), P(None, None)),
+        out_specs=P(None, None),
+        check_rep=False
+    )
+    def _print_output2(stage_index, i, tensor):
+        jax.debug.print("stage_index: {s}, iteration: {i}, output: {t}", s=stage_index, i=i, t=tensor)
+        return tensor
 
     @partial(
         shard_map,
@@ -223,7 +234,7 @@ def gpipe_spmd_pipeline(
               jnp.roll(c.states_from_prev, -1, axis=0), c.states_from_prev)
         states_from_prev = _print_recv(stage_index, c.i, states_from_prev)
         sent = _pipelined_send(c.states_to_next, full_perm)
-        sent = _print_send(stage_index, c.i, sent)
+        # sent = _print_send(stage_index, c.i, sent)
         # The above code finishes a round of rotating states to the right.
 
         states_to_next, outputs = _compute_fn(
@@ -235,7 +246,7 @@ def gpipe_spmd_pipeline(
                 i=c.i
             )
         )
-        outputs = _print_output(stage_index, c.i, outputs)
+        # outputs = _print_output2(stage_index, c.i, states_to_next)
         states_from_prev = _pipelined_recv(sent, full_perm)
 
         return PipelineCarry(
@@ -244,27 +255,39 @@ def gpipe_spmd_pipeline(
             outputs=outputs,
             i=c.i + 1), None
 
-      with jax.named_scope("peeled_first_iter"):
-        states_to_next, outputs = _compute_fn(
-            PipelineCarry(
-                states_from_prev=states,
-                states_to_next=states,
-                outputs=outputs,
-                i=0,
-            )
-        )
-        states_from_prev = _pipelined_recv(states, full_perm[:-1])
+      states_from_prev = states
+      states_to_next = states
+      # 1. Ramp-up phase.
+      for i in range(num_stages):
+        # For peeled iterations, only passes activations across
+        # first i stages to avoid reading garbage values.
+        with jax.named_scope(f"peeled_iter_{i}"):
+          sent = _pipelined_send(states_to_next, full_perm[:i])
+          states_to_next = jnp.where(stage_index <= i,
+              _compute_fn(
+                  PipelineCarry(
+                      states_from_prev=states_from_prev,
+                      states_to_next=sent,
+                      outputs=outputs,
+                      i=i,
+                  ))[0],
+              states_to_next
+          )
+          # The first stage won't be a receiver in all peeled layers.
+          states_from_prev = _pipelined_recv(sent,
+              full_perm[:(i+1)] if i != num_stages - 1 else full_perm[:i])
+
+      # 2. Steady phase.
       final_carry, _ = jax.lax.scan(
           _body_fn,
           PipelineCarry(
               states_from_prev=states_from_prev,
               states_to_next=states_to_next,
               outputs=outputs,
-              i=1
+              i=num_stages,
           ),
-          length=num_iterations-1,
+          length=(num_iterations - num_stages),
       )
-      # jax.debug.print("final outputs: {o}", o=final_carry.outputs)
 
       with jax.named_scope("peeled_last_send"):
         sent = _pipelined_send(final_carry.states_to_next, full_perm[:-1])
