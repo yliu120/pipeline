@@ -265,7 +265,7 @@ def gpipe_spmd_pipeline(
 
       with jax.named_scope("peeled_last_send"):
         sent = _pipelined_send(final_carry.states_to_next, full_perm[:-1])
-      return final_carry.outputs + jnp.sum(sent) * 0.0
+      return final_carry.outputs
 
     return _apply(staged_params, staged_keys, staged_inputs)
 
