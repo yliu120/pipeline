@@ -10,7 +10,7 @@ git_repository(
 
 git_repository(
     name = "jax-src",
-    commit = "53de868968ed5f6714bfbbbbde30f60236f45866",
+    commit = "78da5df2e023fba605afd1834fd701686e7569d8",
     remote = "https://github.com/yliu120/jax.git",
 )
 
