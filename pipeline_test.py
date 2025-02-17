@@ -322,10 +322,10 @@ class SpmdPipelineTest(unittest.TestCase):
     np.testing.assert_allclose(pipelined_re, non_pipelined_re)
 
   def test_spmd_pipeline_with_nested_shard_map(self):
-    global_batch_size = 32
+    global_batch_size = 12
     hidden_dim = 8
     num_stages = 4
-    num_microbatches = 8
+    num_microbatches = 6
     circular_repeats = 4
 
     mesh = jax.make_mesh(
